@@ -1,0 +1,14 @@
+ports/*/build/
+ports/*/pak/bin/
+build/
+dist/
+.DS_Store
+
+# personal test music — not part of the app
+Fountains Of Wayne/
+*.m4a
+*.mp3
+*.flac
+*.ogg
+*.wav
+*.opus
