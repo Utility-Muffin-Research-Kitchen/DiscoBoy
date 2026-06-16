@@ -55,6 +55,8 @@
 #define ICON_SHUFFLE "\xEE\x81\x83"   /* shuffle      E043 */
 #define ICON_REPEAT  "\xEE\x81\x80"   /* repeat       E040 */
 #define ICON_REPEAT1 "\xEE\x81\x81"   /* repeat_one   E041 */
+#define ICON_PREV    "\xEE\x81\x85"   /* skip_previous E045 */
+#define ICON_NEXT    "\xEE\x81\x84"   /* skip_next     E044 */
 
 typedef enum { VIEW_LIBRARY = 0, VIEW_NOWPLAYING } disco_view;
 typedef enum { REPEAT_OFF = 0, REPEAT_ALL, REPEAT_ONE } disco_repeat;
@@ -88,10 +90,15 @@ static bool          g_meta_running = false;
 static volatile bool g_meta_stop = false;
 static volatile bool g_meta_done = false;
 
-/* live audio status (polled from the daemon) */
-static char     g_output[16] = "";         /* current output name, or "" before first poll */
-static int      g_volume = -1;
-static uint32_t g_last_poll = 0;
+/* live audio status (polled from the daemon on a background thread so the IPC
+   round-trip never hitches the render loop / marquee scroll). */
+static char            g_output[16] = "";  /* current output name, or "" before first poll */
+static char            g_bt_name[64] = "";  /* connected BT device friendly name (when on BT) */
+static int             g_volume = -1;
+static pthread_mutex_t g_status_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t       g_poll_thread;
+static bool            g_poll_running = false;
+static volatile bool   g_poll_stop = false;
 
 /* L2/R2 hold-to-scrub: triggers don't auto-repeat, so we seek on a timer while held */
 static int      g_scrub = 0;               /* -1 back, +1 forward, 0 idle */
@@ -109,8 +116,13 @@ static TTF_Font *g_hint_font = NULL;
 /* Disco Boy wordmark for the title band (white, tinted to the theme text color). */
 static SDL_Texture *g_header = NULL;
 
-/* marquee state for overflowing text + per-frame delta */
-static cat_marquee g_mq_row, g_mq_title, g_mq_artist;
+/* Vinyl-record placeholder shown when a track has no cover art. */
+static SDL_Texture *g_record = NULL;
+
+/* marquee state for overflowing text + per-frame delta. One state per text that
+   can scroll at the same time on screen (selected row title + its band line; the
+   panel's title + band + album), so they advance independently. */
+static cat_marquee g_mq_row, g_mq_row_sub, g_mq_title, g_mq_artist, g_mq_album;
 static int         g_mq_row_key = -1, g_mq_np_key = -2;
 static uint32_t    g_frame_ms = 0, g_dt = 0;
 static bool        g_mq_anim = false;   /* set by any marquee still scrolling this frame */
@@ -236,6 +248,68 @@ static void *disco_meta_worker(void *arg) {
     return NULL;
 }
 
+/* Best-effort friendly name of the connected Bluetooth audio device, read from
+   bluealsa (the same service Disco Boy routes BT audio through, so it reflects
+   exactly the device producing sound). Standalone: no dependency on the daemon.
+   `bluealsa-aplay -l` prints e.g.  "hci0: AA:.. [OpenRun Pro by Shokz], ..." —
+   we take the first bracketed name. Empty on failure. Runs off the UI thread. */
+static void disco_resolve_bt_name(char *out, size_t n) {
+    out[0] = '\0';
+    FILE *fp = popen("/usr/bin/bluealsa-aplay -l 2>/dev/null", "r");
+    if (!fp) return;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        char *lb = strchr(line, '[');
+        char *rb = lb ? strchr(lb, ']') : NULL;
+        if (lb && rb && rb > lb + 1) {
+            size_t len = (size_t)(rb - lb - 1);
+            if (len >= n) len = n - 1;
+            memcpy(out, lb + 1, len);
+            out[len] = '\0';
+            break;
+        }
+    }
+    pclose(fp);
+}
+
+/* Background worker: poll the daemon for the live audio output + volume every
+   ~500ms. Off the UI thread so the blocking socket round-trip can't stall the
+   render loop — that periodic stall was a visible hitch in the marquee scroll. */
+static void *disco_status_worker(void *arg) {
+    (void)arg;
+    while (!g_poll_stop) {
+        disco_audio_status as;
+        if (disco_status_query(&as)) {
+            if (as.output[0]) {
+                pthread_mutex_lock(&g_status_lock);
+                snprintf(g_output, sizeof(g_output), "%s", as.output);
+                pthread_mutex_unlock(&g_status_lock);
+                disco_audio_set_output(as.output);   /* cheap: flags a reopen only on change */
+
+                /* Resolve the BT device name lazily while on Bluetooth; clear it
+                   otherwise so a later (re)connect re-resolves a fresh name. */
+                bool is_bt = (strcasecmp(as.output, "BLUETOOTH") == 0), need;
+                pthread_mutex_lock(&g_status_lock);
+                if (!is_bt) g_bt_name[0] = '\0';
+                need = is_bt && g_bt_name[0] == '\0';
+                pthread_mutex_unlock(&g_status_lock);
+                if (need) {
+                    char nm[64];
+                    disco_resolve_bt_name(nm, sizeof(nm));
+                    if (nm[0]) {
+                        pthread_mutex_lock(&g_status_lock);
+                        snprintf(g_bt_name, sizeof(g_bt_name), "%s", nm);
+                        pthread_mutex_unlock(&g_status_lock);
+                    }
+                }
+            }
+            if (as.volume >= 0) { g_volume = as.volume; disco_audio_set_volume(as.volume); }
+        }
+        for (int i = 0; i < 10 && !g_poll_stop; i++) usleep(50 * 1000);  /* ~500ms, responsive stop */
+    }
+    return NULL;
+}
+
 /* ---- per-track display fields (tag if ready, else filename/folder fallback) ---- */
 
 static const char *disco_track_title(const disco_track *t) {
@@ -274,10 +348,20 @@ static const char *disco_track_album(const disco_track *t) {
 }
 
 static const char *disco_output_label(void) {
-    const char *o = g_output[0] ? g_output : getenv("JAWAKA_AUDIO_OUTPUT");
+    static char snap[16];                  /* UI-thread-only copy of the worker's g_output */
+    pthread_mutex_lock(&g_status_lock);
+    snprintf(snap, sizeof(snap), "%s", g_output);
+    pthread_mutex_unlock(&g_status_lock);
+    const char *o = snap[0] ? snap : getenv("JAWAKA_AUDIO_OUTPUT");
     if (!o || !o[0]) o = getenv("UMRK_AUDIO_OUTPUT");
     if (o) {
-        if (!strcasecmp(o, "BLUETOOTH")) return "Bluetooth";
+        if (!strcasecmp(o, "BLUETOOTH")) {
+            static char bt[64];            /* the connected device's name, if known */
+            pthread_mutex_lock(&g_status_lock);
+            snprintf(bt, sizeof(bt), "%s", g_bt_name);
+            pthread_mutex_unlock(&g_status_lock);
+            return bt[0] ? bt : "Bluetooth";
+        }
         if (!strcasecmp(o, "HEADSET"))   return "Headphones";
         if (!strcasecmp(o, "HDMI"))      return "HDMI";
         if (!strcasecmp(o, "SPEAKER"))   return "Speaker";
@@ -422,6 +506,12 @@ static void disco_draw_art(int x, int y, int side) {
             return;
         }
     }
+    /* No cover art: the vinyl record placeholder (filling the square; its
+       transparent corners let the theme background show through). */
+    if (g_record) {
+        cat_draw_image(g_record, x, y, side, side);
+        return;
+    }
     int r = (int)(th->pill_radius_ratio * side * 0.26f + 0.5f);
     cat_draw_rounded_rect_ex(x, y, side, side, r, corners, th->accent);
     int disc = side * 60 / 100;
@@ -497,8 +587,8 @@ static void disco_draw_item(int idx, int x, int y, int w, int h, bool selected, 
     disco_text(med, disco_track_title(t), tx, title_y, main_c, avail,
                selected ? &g_mq_row : NULL);
     if (artist[0])
-        cat_draw_text_ellipsized(small, artist, lx, title_y + TTF_FontHeight(med) - cat_scale(1),
-                                 sub_c, rx - lx);
+        disco_text(small, artist, lx, title_y + TTF_FontHeight(med) - cat_scale(1),
+                   sub_c, rx - lx, selected ? &g_mq_row_sub : NULL);
     if (durs[0]) {
         int dy = pill_y + (pill_h - dh) / 2;
         cat_draw_text(small, durs, rx - dw, dy, sub_c);
@@ -522,16 +612,38 @@ static void disco_draw_output_chip(SDL_Rect content) {
     cat_draw_text(small, lbl, cx + padx, cy + pady, th->hint);
 }
 
-/* Draw the Disco Boy wordmark in the title band, as-is, scaled to fit. Falls back
-   to the text title if the image is missing. */
+/* Draw the Disco Boy wordmark as-is, filling the title band height with just a
+   sliver of padding top/bottom. Falls back to the text title if the image is gone. */
+/* Load the wordmark as a white silhouette (RGB forced to white, alpha kept) so
+   it can be color-modded to the active theme color at draw time. The original
+   art's anti-aliased edges survive via the preserved alpha channel. */
+static SDL_Texture *disco_load_wordmark(const char *path) {
+    SDL_Surface *raw = IMG_Load(path);
+    if (!raw) return NULL;
+    SDL_Surface *s = SDL_ConvertSurfaceFormat(raw, SDL_PIXELFORMAT_ARGB8888, 0);
+    SDL_FreeSurface(raw);
+    if (!s) return NULL;
+    SDL_LockSurface(s);
+    Uint32 *px = (Uint32 *)s->pixels;
+    int n = (s->pitch / 4) * s->h;
+    for (int i = 0; i < n; i++) px[i] |= 0x00FFFFFFu;   /* keep alpha, force RGB white */
+    SDL_UnlockSurface(s);
+    SDL_Texture *t = SDL_CreateTextureFromSurface(cat_get_renderer(), s);
+    SDL_FreeSurface(s);
+    if (t) SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+    return t;
+}
+
 static void disco_draw_header(SDL_Rect content) {
     int tw = 0, thh = 0;
     if (!g_header || SDL_QueryTexture(g_header, NULL, NULL, &tw, &thh) != 0 || tw <= 0 || thh <= 0) {
         cat_draw_screen_title("Disco Boy", NULL);
         return;
     }
+    ap_theme *th = cat_get_theme();       /* tint the wordmark to the theme accent */
+    SDL_SetTextureColorMod(g_header, th->highlight.r, th->highlight.g, th->highlight.b);
     int band = content.y;                 /* the title band is [0, content.y] */
-    int h = band - cat_scale(12);
+    int h = band - cat_scale(20);         /* ~9px top/bottom padding in the title band */
     if (h < cat_scale(14)) h = cat_scale(14);
     int w = h * tw / thh;
     int y = (band - h) / 2;
@@ -699,7 +811,7 @@ static void disco_render_library(SDL_Rect content) {
         char aly[300];
         disco_album_year(t, aly, sizeof(aly));
         if (aly[0]) {
-            cat_draw_text_ellipsized(small, aly, R.x, y, th->hint, R.w);
+            disco_text(small, aly, R.x, y, th->hint, R.w, &g_mq_album);
             y += TTF_FontHeight(small) + CAT_S(1);
         }
         char fs[64];
@@ -758,7 +870,7 @@ static void disco_render_nowplaying(SDL_Rect content) {
         else if (aly[0])      snprintf(line, sizeof(line), "%s", aly);
         else                  snprintf(line, sizeof(line), "%s", fmt);
         if (line[0]) {
-            disco_text(small, line, I.x, y, th->hint, I.w, NULL);
+            disco_text(small, line, I.x, y, th->hint, I.w, &g_mq_album);
             y += TTF_FontHeight(small);
         }
     }
@@ -766,32 +878,38 @@ static void disco_render_nowplaying(SDL_Rect content) {
     y += disco_draw_progress(I.x, y, I.w, CAT_S(5));
     y += CAT_S(18);
 
-    /* transport — top row: rewind / play-pause / fast-forward (the sides scrub the
-       track +/-10s); bottom row: shuffle / repeat. d-pad navigable: Left/Right within
-       a row, Up/Down between rows, A activates. Glyphs = bundled Material Icons. */
+    /* transport — top row: prev-track / rewind / play-pause / fast-forward / next-track
+       (rewind/forward scrub +/-5s, prev/next skip tracks); bottom row: shuffle / repeat.
+       d-pad navigable: Left/Right within a row, Up/Down between rows, A activates.
+       Glyphs = bundled Material Icons. */
     int gap = CAT_S(34);
     int cx  = I.x + I.w / 2;
     bool playing = disco_audio_is_playing();
     TTF_Font *ic  = g_icons    ? g_icons    : med;
     TTF_Font *ics = g_icons_sm ? g_icons_sm : small;
-    int slot[3] = { cx - btn - gap, cx, cx + btn + gap };
+    int pitch = btn + gap;                          /* spacing between the 5 row-1 slots */
+    int max_pitch = (I.w - btn - CAT_S(16)) / 4;    /* keep all five inside the column */
+    if (max_pitch > 0 && pitch > max_pitch) pitch = max_pitch;
+    int slot[5] = { cx - 2 * pitch, cx - pitch, cx, cx + pitch, cx + 2 * pitch };
     int sx[2]   = { cx - CAT_S(48), cx + CAT_S(48) };   /* shuffle, repeat */
     int row1_cy = y + btn / 2;
     int row2_cy = y + btn + CAT_S(14) + row2 / 2;
 
     int fpad = CAT_S(8);
     ap_color halo = { th->highlight.r, th->highlight.g, th->highlight.b, 70 };
-    if (g.np_focus <= 2)
+    if (g.np_focus <= 4)
         disco_pill(slot[g.np_focus] - btn / 2 - fpad, row1_cy - btn / 2 - fpad,
                    btn + fpad * 2, btn + fpad * 2, halo);
     else
-        disco_pill(sx[g.np_focus - 3] - row2 / 2 - fpad, row2_cy - row2 / 2 - fpad,
+        disco_pill(sx[g.np_focus - 5] - row2 / 2 - fpad, row2_cy - row2 / 2 - fpad,
                    row2 + fpad * 2, row2 + fpad * 2, halo);
 
-    disco_icon(ic, ICON_REWIND, slot[0], row1_cy, g.np_focus == 0 ? th->text : th->hint);
-    cat_draw_pill(slot[1] - btn / 2, y, btn, btn, th->highlight);
-    disco_icon(ic, playing ? ICON_PAUSE : ICON_PLAY, slot[1], row1_cy, th->highlighted_text);
-    disco_icon(ic, ICON_FORWARD, slot[2], row1_cy, g.np_focus == 2 ? th->text : th->hint);
+    disco_icon(ic, ICON_PREV,    slot[0], row1_cy, g.np_focus == 0 ? th->text : th->hint);
+    disco_icon(ic, ICON_REWIND,  slot[1], row1_cy, g.np_focus == 1 ? th->text : th->hint);
+    cat_draw_pill(slot[2] - btn / 2, y, btn, btn, th->highlight);
+    disco_icon(ic, playing ? ICON_PAUSE : ICON_PLAY, slot[2], row1_cy, th->highlighted_text);
+    disco_icon(ic, ICON_FORWARD, slot[3], row1_cy, g.np_focus == 3 ? th->text : th->hint);
+    disco_icon(ic, ICON_NEXT,    slot[4], row1_cy, g.np_focus == 4 ? th->text : th->hint);
 
     disco_icon(ics, ICON_SHUFFLE, sx[0], row2_cy, g.shuffle ? th->highlight : th->hint);
     disco_icon(ics, g.repeat == REPEAT_ONE ? ICON_REPEAT1 : ICON_REPEAT, sx[1], row2_cy,
@@ -802,7 +920,7 @@ int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
     memset(&g, 0, sizeof(g));
     g.now_playing = -1;
-    g.np_focus = 1;                 /* default focus = the play/pause button */
+    g.np_focus = 2;                 /* default focus = the play/pause button */
     cat_list_state_init(&g.list, 1);
 
     /* Disco Boy uses Leaf's "Soft" pill/art style - all four corners rounded at a
@@ -839,7 +957,10 @@ int main(int argc, char *argv[]) {
         g_icons_sm = TTF_OpenFont(fp, cat_scale(42));
         if (pd && pd[0]) snprintf(fp, sizeof(fp), "%s/res/header.png", pd);
         else             snprintf(fp, sizeof(fp), "res/header.png");
-        g_header = cat_load_image(fp);
+        g_header = disco_load_wordmark(fp);
+        if (pd && pd[0]) snprintf(fp, sizeof(fp), "%s/res/record.png", pd);
+        else             snprintf(fp, sizeof(fp), "res/record.png");
+        g_record = cat_load_image(fp);
     }
     {
         /* fixed-size hint font from the theme's UI font, ignoring the launcher's
@@ -859,6 +980,9 @@ int main(int argc, char *argv[]) {
         g_meta_running = true;
     else
         g_meta_done = true;
+
+    if (pthread_create(&g_poll_thread, NULL, disco_status_worker, NULL) == 0)
+        g_poll_running = true;
 
     int running = 1;
     while (running) {
@@ -894,22 +1018,26 @@ int main(int argc, char *argv[]) {
                 switch (ev.button) {
                     case CAT_BTN_B:
                     case CAT_BTN_Y:     if (!ev.repeated) g.view = VIEW_LIBRARY; break;
+                    /* focus slots: row1 0=prev 1=rewind 2=play/pause 3=fwd 4=next,
+                       row2 5=shuffle 6=repeat. */
                     case CAT_BTN_LEFT:
-                        if (g.np_focus == 1 || g.np_focus == 2) g.np_focus--;
-                        else if (g.np_focus == 4) g.np_focus = 3;
+                        if (g.np_focus >= 1 && g.np_focus <= 4) g.np_focus--;
+                        else if (g.np_focus == 6) g.np_focus = 5;
                         break;
                     case CAT_BTN_RIGHT:
-                        if (g.np_focus == 0 || g.np_focus == 1) g.np_focus++;
-                        else if (g.np_focus == 3) g.np_focus = 4;
+                        if (g.np_focus <= 3) g.np_focus++;
+                        else if (g.np_focus == 5) g.np_focus = 6;
                         break;
-                    case CAT_BTN_DOWN:  if (g.np_focus <= 2) g.np_focus = (g.np_focus == 2) ? 4 : 3; break;
-                    case CAT_BTN_UP:    if (g.np_focus >= 3) g.np_focus = (g.np_focus == 4) ? 2 : 1; break;
+                    case CAT_BTN_DOWN:  if (g.np_focus <= 4) g.np_focus = (g.np_focus <= 2) ? 5 : 6; break;
+                    case CAT_BTN_UP:    if (g.np_focus >= 5) g.np_focus = (g.np_focus == 5) ? 2 : 3; break;
                     case CAT_BTN_A:     if (!ev.repeated) {
                                             switch (g.np_focus) {
-                                                case 0: disco_audio_seek(-DISCO_SEEK_STEP); break;
-                                                case 2: disco_audio_seek(+DISCO_SEEK_STEP); break;
-                                                case 3: g.shuffle = !g.shuffle; break;
-                                                case 4: g.repeat = (g.repeat + 1) % 3; break;
+                                                case 0: disco_prev(); break;
+                                                case 1: disco_audio_seek(-DISCO_SEEK_STEP); break;
+                                                case 3: disco_audio_seek(+DISCO_SEEK_STEP); break;
+                                                case 4: disco_next(false); break;
+                                                case 5: g.shuffle = !g.shuffle; break;
+                                                case 6: g.repeat = (g.repeat + 1) % 3; break;
                                                 default: disco_toggle(); break;
                                             }
                                         } break;
@@ -937,21 +1065,11 @@ int main(int argc, char *argv[]) {
         if (g.now_playing >= 0 && disco_audio_is_playing()) cat_request_frame_in(500);
         if (!g_meta_done) cat_request_frame_in(250);   /* refresh as metadata fills in */
 
-        /* poll the daemon for the live audio output + volume (the launch-time env
-           goes stale on plug/unplug), then push routing + software volume down. */
+        /* The daemon poll runs on disco_status_worker (off-thread), so its blocking
+           IPC can't hitch the scroll. Still wake ~2x/sec so the output chip tracks
+           plug/unplug even while otherwise idle. */
         uint32_t now = SDL_GetTicks();
-        if (now - g_last_poll >= 500) {
-            g_last_poll = now;
-            disco_audio_status as;
-            if (disco_status_query(&as)) {
-                if (as.output[0]) {
-                    snprintf(g_output, sizeof(g_output), "%s", as.output);
-                    disco_audio_set_output(as.output);
-                }
-                if (as.volume >= 0) { g_volume = as.volume; disco_audio_set_volume(as.volume); }
-            }
-        }
-        cat_request_frame_in(500);   /* keep the poll cadence alive even when idle */
+        cat_request_frame_in(500);
 
         /* marquee timing: ms since last frame, and reset scroll on track/cursor change */
         g_dt = g_frame_ms ? (now - g_frame_ms) : 0;
@@ -959,9 +1077,20 @@ int main(int argc, char *argv[]) {
         if (g_mq_np_key != g.now_playing) {
             g_mq_np_key = g.now_playing;
             g_mq_title.elapsed_ms = 0; g_mq_artist.elapsed_ms = 0;
+            g_mq_album.elapsed_ms = 0;
+            /* Pin the now-playing track to the top of the list (clamped near the
+               end, where it can't be), and bring the cursor with it so the
+               highlight stays put and browsing resumes smoothly from there. */
+            if (g.now_playing >= 0) {
+                int maxoff = g.count - g.list.visible_rows;
+                if (maxoff < 0) maxoff = 0;
+                g.list.scroll_offset = g.now_playing < maxoff ? g.now_playing : maxoff;
+                g.list.cursor = g.now_playing;
+            }
         }
         if (g_mq_row_key != g.list.cursor) {
-            g_mq_row_key = g.list.cursor; g_mq_row.elapsed_ms = 0;
+            g_mq_row_key = g.list.cursor;
+            g_mq_row.elapsed_ms = 0; g_mq_row_sub.elapsed_ms = 0;
         }
         g_mq_anim = false;
 
@@ -990,15 +1119,19 @@ int main(int argc, char *argv[]) {
             };
             cat_draw_footer(footer, 5);
         }
-        if (g_mq_anim) cat_request_frame_in(33);   /* keep the marquee scrolling */
+        if (g_mq_anim) cat_request_frame();   /* 60fps active pacing while scrolling
+                                                 (render-cost-corrected; matches the
+                                                 launcher's marquee — smooth, not steppy) */
         cat_present();
     }
 
+    if (g_poll_running) { g_poll_stop = true; pthread_join(g_poll_thread, NULL); }
     if (g_meta_running) { g_meta_stop = true; pthread_join(g_meta_thread, NULL); }
     if (g_icons)     TTF_CloseFont(g_icons);
     if (g_icons_sm)  TTF_CloseFont(g_icons_sm);
     if (g_hint_font) TTF_CloseFont(g_hint_font);
     if (g_header)    SDL_DestroyTexture(g_header);
+    if (g_record)    SDL_DestroyTexture(g_record);
     if (g.art) { SDL_DestroyTexture(g.art); g.art = NULL; }
     disco_audio_shutdown();
     cat_quit();
