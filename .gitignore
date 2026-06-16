@@ -5,6 +5,7 @@ dist/
 .DS_Store
 
 # personal test music — not part of the app
+Music/
 Fountains Of Wayne/
 *.m4a
 *.mp3

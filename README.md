@@ -7,40 +7,71 @@ Leaf / UMRK naming DNA.
 
 ## What it does
 
-Browses a music folder, lists the tracks, and plays them with a now-playing bar
-(track, status, elapsed / total, auto-advance to the next track). The MLP1's mono
-speaker is weak - so Disco Boy follows Leaf's audio routing and plays straight to a
-Bluetooth headset when one is connected.
+Browses your music by **Artists**, **Albums**, or **Folders**, with cover art, a
+focused now-playing screen, and a play queue that follows whatever you played from.
+The MLP1's mono speaker is weak, so Disco Boy follows Leaf's audio routing and plays
+straight to a Bluetooth headset when one is connected.
+
+## Browsing
+
+A tab bar across the top switches between three views (L1 / R1):
+
+- **Artists** -> that artist's albums -> tracks.
+- **Albums** -> tracks, with a cover-art header (album / artist / year / total time).
+- **Folders** -> the real directory tree, for whatever is on the card.
+
+Every list stays small and navigable at any library size. Left / Right jump by
+letter, and the now-playing track pins to the top of the list it belongs to. Play a
+track and the **queue** becomes the list you played it from, so next / previous /
+shuffle / auto-advance all follow that album or folder.
+
+Cover art is resolved per track: a sidecar `cover.png` / `folder.jpg` (matched
+case-insensitively) if present, otherwise the file's own **embedded art** (ID3 APIC,
+FLAC PICTURE, MP4 cover), extracted and cached. List thumbnails are downscaled; the
+now-playing and album-header art are full resolution.
 
 ## Audio
 
-Decoding uses single-header decoders vendored under `third_party/`. **WAV works
-today** (dr_wav). mp3/flac/ogg are next (dr_mp3 / dr_flac / stb_vorbis behind the
-same `disco_audio_*` interface, dispatched by file extension).
+The common formats decode through small vendored single-header decoders under
+`third_party/`: **WAV** (dr_wav), **MP3** (dr_mp3), **FLAC** (dr_flac), and **OGG
+Vorbis** (stb_vorbis). Everything else - **M4A / AAC / ALAC, Opus, WMA, AIFF, APE,
+WavPack, ...** - decodes through **FFmpeg**, which the device already ships (the
+LoongOS Kodi build). The app links against tiny SONAME stub libraries and binds to
+the device's real `libav*` at runtime, so no FFmpeg binaries are shipped in the pak.
+Tags, duration, and embedded art for those formats also come from FFmpeg.
 
 Output is **libasound (ALSA) direct**, not SDL audio: a playback thread streams
-decoded S16 frames to a pcm. The device is picked from Leaf's `JAWAKA_AUDIO_OUTPUT`
-- `BLUETOOTH` opens the BlueALSA `bluealsa` pcm (A2DP straight to the headset), and
+decoded S16 frames to a pcm. The device follows Leaf's live `audio_output`:
+`BLUETOOTH` opens the BlueALSA `bluealsa` pcm (A2DP straight to the headset), and
 anything else opens ALSA `default` (PulseAudio -> speaker). This mirrors how the
-RetroArch runner routes game audio, so headphones that work in games work here too.
-The device is chosen once at launch, so re-open the app if you connect a headset
-while it is already running.
+RetroArch runner routes game audio, and Disco Boy re-routes live when you plug in a
+jack or (dis)connect Bluetooth.
 
 ## Controls
+
 | Button | Action |
 |---|---|
-| Up / Down | move in the track list |
-| A | play the highlighted track |
+| Up / Down | move in the list |
+| Left / Right | jump by letter |
+| A | open (artist / album / folder) or play a track |
+| B | back up one level |
 | X | play / pause |
-| L1 / R1 | previous / next track |
-| B | quit |
+| Y | toggle the now-playing screen |
+| L1 / R1 | switch tab |
+| L2 / R2 | hold to seek (-/+) |
+| MENU | quit |
+
+On the now-playing screen the transport is a full row - skip-prev / rewind /
+play-pause / forward / skip-next, with shuffle and repeat below; there L1 / R1 are
+previous / next track and L2 / R2 hold to seek.
 
 ## Music location
+
 Tracks are read (recursively) from `$MUSIC_PATH`, else `$SDCARD_PATH/Music`, else
-`./Music`. WAV, MP3, FLAC and OGG (Vorbis) decode; `.opus`/`.m4a` are listed but not
-yet decoded. Per-folder album art is a sidecar `cover.png` / `folder.jpg`.
+`./Music`.
 
 ## Build
+
 Cross-compiled for the MLP1 in the shared toolchain container, with `DiscoBoy`,
 `Catastrophe`, and `Jawaka` as sibling checkouts:
 
@@ -53,7 +84,16 @@ make package-platform PLATFORM=mlp1
 assembles the staged pak from `pak/` + the binary. Leaf wires app packaging through
 its own root `make package-platform` / `make stage-app APP=DiscoBoy DEVICE=mlp1`.
 
+The FFmpeg fallback uses vendored FFmpeg 4.4 public headers
+(`third_party/ffmpeg/include`) plus small SONAME stub libraries
+(`third_party/ffmpeg/stub`) generated only to satisfy the linker; the device
+provides the real `libav*` at runtime. `scripts/make-record-placeholder.py`
+regenerates the vinyl no-art placeholder.
+
 ## Credits
-Decoding uses the public-domain single-header decoders dr_wav / dr_mp3 / dr_flac
-(mackron) and stb_vorbis (Sean Barrett). Transport glyphs are a subset of Material
-Icons (Apache License 2.0, Google). See `pak/res/media-icons.ttf`.
+
+Common-format decoding uses the public-domain single-header decoders dr_wav /
+dr_mp3 / dr_flac (mackron) and stb_vorbis (Sean Barrett). Other formats decode via
+FFmpeg (LGPL), dynamically linked to the copy already on the device. Transport
+glyphs are a subset of Material Icons (Apache License 2.0, Google). See
+`pak/res/media-icons.ttf`.

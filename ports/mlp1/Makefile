@@ -15,13 +15,22 @@ INCLUDES := -I$(SRC) -I$(DISCOBOY)/third_party -I$(CATA)/include -I$(CJSON) \
 COMMON   := -O2 -DPLATFORM_MLP1 $(INCLUDES)
 APP_CFLAGS    := -std=gnu11 -Wall -Wextra -Wno-unused-parameter $(COMMON)
 VENDOR_CFLAGS := -std=gnu11 -w $(COMMON)   # dr_*, stb_vorbis, cJSON: third-party, silence noise
+
+# FFmpeg fallback decoder (disco_ff.c): vendored 4.4 headers, linked against tiny
+# SONAME stub libs (third_party/ffmpeg/stub) so the device's real libav* (FFmpeg
+# 4.4) satisfy the symbols at runtime. No FFmpeg binaries shipped in the app.
+FF_INC   := -I$(DISCOBOY)/third_party/ffmpeg/include
+FF_LIBS  := -L$(DISCOBOY)/third_party/ffmpeg/stub \
+            -l:libavformat.so.58 -l:libavcodec.so.58 -l:libavutil.so.56 -l:libswresample.so.3
+
 # Audio output is libasound (ALSA) direct, so it can target the `bluealsa` pcm for
 # Bluetooth the same way the RetroArch runner does. SDL is still linked for the UI.
-LDFLAGS  := -L$(SYSROOT)/usr/lib -lSDL2 -lSDL2_ttf -lSDL2_image -lasound -lm -lpthread
+LDFLAGS  := -L$(SYSROOT)/usr/lib -lSDL2 -lSDL2_ttf -lSDL2_image -lasound -lm -lpthread $(FF_LIBS)
 
 # Each decoder's IMPLEMENTATION lives in its own TU (compiled -w); disco_audio.c
 # includes only the declaration side of each header (stb_vorbis via HEADER_ONLY).
-OBJ := $(OBJDIR)/main.o $(OBJDIR)/disco_audio.o $(OBJDIR)/disco_meta.o $(OBJDIR)/disco_status.o \
+OBJ := $(OBJDIR)/main.o $(OBJDIR)/disco_audio.o $(OBJDIR)/disco_ff.o $(OBJDIR)/disco_meta.o \
+       $(OBJDIR)/disco_status.o \
        $(OBJDIR)/dr_wav_impl.o $(OBJDIR)/dr_mp3_impl.o $(OBJDIR)/dr_flac_impl.o \
        $(OBJDIR)/stb_vorbis.o $(OBJDIR)/cJSON.o
 
@@ -36,6 +45,8 @@ $(OBJDIR)/main.o: $(SRC)/main.c | $(OBJDIR)
 	$(CC) $(APP_CFLAGS) -c -o $@ $<
 $(OBJDIR)/disco_audio.o: $(SRC)/disco_audio.c | $(OBJDIR)
 	$(CC) $(APP_CFLAGS) -c -o $@ $<
+$(OBJDIR)/disco_ff.o: $(SRC)/disco_ff.c | $(OBJDIR)
+	$(CC) $(APP_CFLAGS) $(FF_INC) -c -o $@ $<
 $(OBJDIR)/disco_meta.o: $(SRC)/disco_meta.c | $(OBJDIR)
 	$(CC) $(APP_CFLAGS) -c -o $@ $<
 $(OBJDIR)/disco_status.o: $(SRC)/disco_status.c | $(OBJDIR)

@@ -1,4 +1,5 @@
 #include "disco_audio.h"
+#include "disco_ff.h"
 
 #include "dr_wav.h"
 #include "dr_mp3.h"
@@ -30,7 +31,7 @@ static int disco__env_is_bt(void) {
 /* ---- decoder abstraction: WAV / MP3 / FLAC / OGG behind a uniform S16 read ----
    Each backend is a single-header decoder vendored under third_party/. We pick one
    by file extension, then the playback thread only ever calls disco__dec_read(). */
-typedef enum { DEC_NONE = 0, DEC_WAV, DEC_MP3, DEC_FLAC, DEC_OGG } disco_dec;
+typedef enum { DEC_NONE = 0, DEC_WAV, DEC_MP3, DEC_FLAC, DEC_OGG, DEC_FF } disco_dec;
 
 static disco_dec   s_kind = DEC_NONE;
 static drwav       s_wav;
@@ -47,6 +48,7 @@ static disco_dec disco__kind_for(const char *path) {
     if (strcasecmp(dot, ".flac") == 0) return DEC_FLAC;
     if (strcasecmp(dot, ".ogg")  == 0 ||
         strcasecmp(dot, ".oga")  == 0) return DEC_OGG;
+    if (disco_ff_handles(path)) return DEC_FF;   /* m4a/aac/opus/wma/... via FFmpeg */
     return DEC_NONE;
 }
 
@@ -79,6 +81,9 @@ static bool disco__dec_open(const char *path, unsigned *ch, unsigned *rate, uint
         *total = stb_vorbis_stream_length_in_samples(s_ogg);
         return true;
     }
+    case DEC_FF:
+        if (!disco_ff_open(path, ch, rate, total)) break;
+        return true;
     default: break;
     }
     s_kind = DEC_NONE;
@@ -96,6 +101,7 @@ static uint64_t disco__dec_read(int16_t *buf, uint64_t frames) {
                       s_ogg, s_ogg_ch, buf, (int)(frames * (uint64_t)s_ogg_ch));
         return got < 0 ? 0 : (uint64_t)got;   /* returns frames (samples per channel) */
     }
+    case DEC_FF:   return disco_ff_read(buf, frames);
     default: return 0;
     }
 }
@@ -106,6 +112,7 @@ static void disco__dec_close(void) {
     case DEC_MP3:  drmp3_uninit(&s_mp3); break;
     case DEC_FLAC: if (s_flac) { drflac_close(s_flac);  s_flac = NULL; } break;
     case DEC_OGG:  if (s_ogg)  { stb_vorbis_close(s_ogg); s_ogg  = NULL; } break;
+    case DEC_FF:   disco_ff_close(); break;
     default: break;
     }
     s_kind = DEC_NONE;
@@ -158,6 +165,7 @@ static void disco__do_seek(void) {
     case DEC_MP3:  drmp3_seek_to_pcm_frame(&s_mp3, f); break;
     case DEC_FLAC: drflac_seek_to_pcm_frame(s_flac, f); break;
     case DEC_OGG:  if (s_ogg) stb_vorbis_seek_frame(s_ogg, (unsigned)f); break;
+    case DEC_FF:   disco_ff_seek(f); break;
     default: break;
     }
     s_cursor = f;
