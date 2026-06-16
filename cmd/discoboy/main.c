@@ -34,6 +34,7 @@
 #include <dirent.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,6 +72,8 @@ typedef struct {
     char         title[256];         /* prettified filename (fallback title) */
     char         path[DISCO_MAX_PATH];
     disco_meta   meta;               /* tags + duration, filled by the worker */
+    long long    mtime;              /* file mtime + size: cache key (set by worker) */
+    long long    size;
     volatile int meta_ready;         /* 0 = pending, 1 = meta is valid to read */
 } disco_track;
 
@@ -112,6 +115,7 @@ static struct {
     int            now_playing;            /* index, or -1 */
     bool           paused;
     disco_view     view;
+    bool           art_only;               /* SELECT: full-screen cover, no chrome */
     disco_tab      tab;                    /* current browse tab */
     int            np_focus;               /* transport focus 0 rw, 1 play, 2 ff, 3 shuffle, 4 repeat */
     bool           shuffle;
@@ -280,6 +284,7 @@ static void disco_scan_dir(const char *dir, int depth) {
             snprintf(t->name, sizeof(t->name), "%s", e->d_name);
             disco_prettify(e->d_name, t->title, sizeof(t->title));
             t->meta_ready = 0;
+            t->mtime = 0; t->size = 0;
             g.count++;
         }
     }
@@ -295,22 +300,159 @@ static void disco_scan(const char *dir) {
 /* music dir: $MUSIC_PATH, then $SDCARD_PATH/Music, then ./Music */
 static void disco_resolve_music_dir(char *out, size_t n) {
     const char *m = getenv("MUSIC_PATH");
-    if (m && m[0]) { snprintf(out, n, "%s", m); return; }
     const char *sd = getenv("SDCARD_PATH");
-    if (sd && sd[0]) { snprintf(out, n, "%s/Music", sd); return; }
-    snprintf(out, n, "Music");
+    if (m && m[0])       snprintf(out, n, "%s", m);
+    else if (sd && sd[0]) snprintf(out, n, "%s/Music", sd);
+    else                  snprintf(out, n, "Music");
+    /* drop a trailing slash so path-prefix compares (grandparent fallback) hold */
+    size_t l = strlen(out);
+    while (l > 1 && out[l - 1] == '/') out[--l] = '\0';
 }
 
-/* Background worker: read duration + tags for every track, publish per-track. */
+/* ---- on-disk metadata cache --------------------------------------------------
+
+   Reading tags + duration for a whole library is the slow part of startup (each
+   file is an FFmpeg/decoder open), and it's identical work every launch. So the
+   worker persists what it read to a small cache file keyed by path + mtime + size:
+   on the next launch a file whose mtime/size still match is served from the cache
+   (no decoder open), and only new or changed files are re-read. First launch pays
+   the full scan once; every launch after is near-instant and only touches what
+   actually changed. The cache lives on the SD (persists across reboots, unlike
+   /tmp); a read/write failure (e.g. a read-only card) just falls back to a full
+   scan, so it's purely an optimization. */
+
+#define DISCO_CACHE_MAGIC 0x31434244u   /* "DBC1" */
+#define DISCO_CACHE_VER   1u
+
+typedef struct {
+    char       path[DISCO_MAX_PATH];
+    long long  mtime;
+    long long  size;
+    disco_meta meta;
+} disco_cache_rec;
+
+static disco_cache_rec *g_cache = NULL;
+static int              g_cache_count = 0;
+
+/* Resolve the cache file path under a hidden .discoboy dir on the SD (or, with no
+   SDCARD_PATH, beside the music dir — that dotdir is skipped by the scan). */
+static bool disco_cache_file(char *out, size_t n) {
+    const char *sd = getenv("SDCARD_PATH");
+    const char *base = (sd && sd[0]) ? sd : g.music_dir;
+    char dir[DISCO_MAX_PATH + 16];
+    if ((size_t)snprintf(dir, sizeof(dir), "%s/.discoboy", base) >= sizeof(dir)) return false;
+    mkdir(dir, 0777);   /* best effort; harmless if it already exists */
+    return (size_t)snprintf(out, n, "%s/library.cache", dir) < n;
+}
+
+static void disco_cache_load(void) {
+    g_cache = NULL; g_cache_count = 0;
+    char path[DISCO_MAX_PATH];
+    if (!disco_cache_file(path, sizeof(path))) return;
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    uint32_t magic = 0, ver = 0, msz = 0, count = 0;
+    if (fread(&magic, 4, 1, f) != 1 || magic != DISCO_CACHE_MAGIC ||
+        fread(&ver,   4, 1, f) != 1 || ver   != DISCO_CACHE_VER   ||
+        fread(&msz,   4, 1, f) != 1 || msz   != (uint32_t)sizeof(disco_meta) ||
+        fread(&count, 4, 1, f) != 1 || count == 0 || count > DISCO_MAX_TRACKS) {
+        fclose(f); return;   /* missing/old/foreign cache -> ignore, rescan */
+    }
+    g_cache = calloc(count, sizeof(disco_cache_rec));
+    if (!g_cache) { fclose(f); return; }
+    int n = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t plen = 0;
+        if (fread(&plen, 4, 1, f) != 1 || plen == 0 || plen >= DISCO_MAX_PATH) break;
+        disco_cache_rec *r = &g_cache[n];
+        if (fread(r->path, 1, plen, f) != plen) break;
+        r->path[plen] = '\0';
+        if (fread(&r->mtime, 8, 1, f) != 1) break;
+        if (fread(&r->size,  8, 1, f) != 1) break;
+        if (fread(&r->meta, sizeof(disco_meta), 1, f) != 1) break;
+        n++;
+    }
+    g_cache_count = n;
+    fclose(f);
+}
+
+static void disco_cache_free(void) {
+    free(g_cache); g_cache = NULL; g_cache_count = 0;
+}
+
+/* Look up `path` in the loaded cache. `*hint` rolls forward from the last hit so a
+   cache that still lines up with the (sorted) track list costs O(1) per lookup.
+   Returns 1 and fills *out only when path AND mtime AND size all match. */
+static int disco_cache_lookup(int *hint, const char *path,
+                              long long mtime, long long size, disco_meta *out) {
+    for (int k = 0; k < g_cache_count; k++) {
+        int idx = (*hint + k) % g_cache_count;
+        if (strcmp(g_cache[idx].path, path) != 0) continue;
+        *hint = idx + 1;
+        if (g_cache[idx].mtime == mtime && g_cache[idx].size == size) {
+            *out = g_cache[idx].meta;
+            return 1;
+        }
+        return 0;   /* same file, changed on disk -> re-read */
+    }
+    return 0;
+}
+
+/* Persist every track's tags + cache key, written to a temp file then renamed so a
+   crash mid-write can't leave a torn cache. Only the worker calls this, and only
+   after a full pass, so every track's meta is valid. */
+static void disco_cache_save(void) {
+    char path[DISCO_MAX_PATH], tmp[DISCO_MAX_PATH];
+    if (!disco_cache_file(path, sizeof(path))) return;
+    if ((size_t)snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= sizeof(tmp)) return;
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    uint32_t magic = DISCO_CACHE_MAGIC, ver = DISCO_CACHE_VER,
+             msz = (uint32_t)sizeof(disco_meta), count = (uint32_t)g.count;
+    bool ok = fwrite(&magic, 4, 1, f) == 1 && fwrite(&ver,   4, 1, f) == 1 &&
+              fwrite(&msz,   4, 1, f) == 1 && fwrite(&count, 4, 1, f) == 1;
+    for (int i = 0; ok && i < g.count; i++) {
+        const disco_track *t = &g.tracks[i];
+        uint32_t plen = (uint32_t)strlen(t->path);
+        ok = fwrite(&plen, 4, 1, f) == 1 && fwrite(t->path, 1, plen, f) == plen &&
+             fwrite(&t->mtime, 8, 1, f) == 1 && fwrite(&t->size, 8, 1, f) == 1 &&
+             fwrite(&t->meta, sizeof(disco_meta), 1, f) == 1;
+    }
+    if (fclose(f) != 0) ok = false;
+    if (ok) rename(tmp, path);
+    else    unlink(tmp);
+}
+
+/* Background worker: fill duration + tags for every track, served from the cache
+   when the file is unchanged and read from the decoder otherwise; publish each
+   track as it's ready, then persist the cache if anything changed. */
 static void *disco_meta_worker(void *arg) {
     (void)arg;
+    disco_cache_load();
+    bool any_miss = false;
+    int  hint = 0;
     for (int i = 0; i < g.count && !g_meta_stop; i++) {
+        disco_track *t = &g.tracks[i];
+        struct stat st;
+        if (stat(t->path, &st) == 0) {
+            t->mtime = (long long)st.st_mtime;
+            t->size  = (long long)st.st_size;
+        }
         disco_meta m;
-        disco_meta_read(g.tracks[i].path, &m);
-        g.tracks[i].meta = m;          /* fill fields... */
+        if (!disco_cache_lookup(&hint, t->path, t->mtime, t->size, &m)) {
+            disco_meta_read(t->path, &m);
+            any_miss = true;
+        }
+        t->meta = m;                   /* fill fields... */
         __sync_synchronize();          /* ...then publish the ready flag */
-        g.tracks[i].meta_ready = 1;
+        t->meta_ready = 1;
     }
+    /* Save only after a complete pass (every track read), and only when something
+       changed vs the cache on disk — so a steady-state launch writes nothing, and
+       an interrupted run never shrinks a good cache. */
+    if (!g_meta_stop && (any_miss || g_cache_count != g.count))
+        disco_cache_save();
+    disco_cache_free();
     g_meta_done = true;
     return NULL;
 }
@@ -987,7 +1129,10 @@ static int disco_hint_reserved(void) {
     return disco_hint_pill_h() + cat_scale(16);
 }
 
-static void disco_draw_hints(disco_view view) {
+/* Library-view hint bar. The Player view is intentionally hint-less (see the render
+   dispatch): the user reaches it by pressing Y from here, so Y-to-return is the
+   learned inverse, and the rest of the controls are the on-screen transport. */
+static void disco_draw_hints(void) {
     if (!g_hint_font) return;
     ap_theme *th = cat_get_theme();
     int pill_h = disco_hint_pill_h();
@@ -1000,19 +1145,11 @@ static void disco_draw_hints(disco_view view) {
     ap_color line = { th->text.r, th->text.g, th->text.b, 26 };
     cat_draw_rect(m, y - cat_scale(8), sw - m * 2, lh, line);
 
-    if (view == VIEW_LIBRARY) {
-        static const disco_hint left[] = { {"L/R1","Tabs"}, {"B","Back"},
-                                           {"X","Pause"}, {"MENU","Quit"} };
-        disco_draw_hint_group(left, 4, m, y, pill_h, false);
-        static const disco_hint right[] = { {"A","Play"} };
-        disco_draw_hint_group(right, 1, sw - m - disco_hint_group_w(right, 1, pill_h), y, pill_h, true);
-    } else {
-        static const disco_hint left[] = { {"L/R1","Track"}, {"L/R2","Seek"},
-                                           {"X","Pause"}, {"Y","List"} };
-        disco_draw_hint_group(left, 4, m, y, pill_h, false);
-        static const disco_hint right[] = { {"A","Select"} };
-        disco_draw_hint_group(right, 1, sw - m - disco_hint_group_w(right, 1, pill_h), y, pill_h, true);
-    }
+    static const disco_hint left[] = { {"M","Quit"}, {"L/R1","Tabs"}, {"L/R2","Seek"},
+                                       {"X","Pause"}, {"Y","Player"} };
+    disco_draw_hint_group(left, 5, m, y, pill_h, false);
+    static const disco_hint right[] = { {"A","Play"} };
+    disco_draw_hint_group(right, 1, sw - m - disco_hint_group_w(right, 1, pill_h), y, pill_h, true);
 }
 
 /* Compose "Album  ·  Year" (either part optional). */
@@ -1045,6 +1182,33 @@ static void disco_album_of(const disco_track *t, char *out, size_t n) {
     if (r) __sync_synchronize();
     if (r && t->meta.album[0]) { snprintf(out, n, "%s", t->meta.album); return; }
     disco_parent_name(t->path, out, n);
+}
+
+/* Pre-tag artist fallback: the grandparent folder name (the "Artist" dir in an
+   Artist/Album/track layout), so the Artists view reads sensibly the instant the
+   app opens, before the metadata worker has filled tags in. Loose tracks and album
+   folders sitting directly under the music root have no artist dir -> "" (Unknown
+   Artist). Replaced by the real tag for each track as the worker publishes it. */
+static void disco_grandparent_name(const char *path, char *out, size_t n) {
+    out[0] = '\0';
+    char tmp[DISCO_MAX_PATH];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    char *slash = strrchr(tmp, '/');     /* drop filename  -> parent (album) dir */
+    if (!slash) return;
+    *slash = '\0';
+    slash = strrchr(tmp, '/');           /* drop album dir -> grandparent (artist) */
+    if (!slash) return;
+    *slash = '\0';
+    if (strcmp(tmp, g.music_dir) == 0) return;   /* album folder sits at music root */
+    const char *base = strrchr(tmp, '/');
+    snprintf(out, n, "%.*s", (int)n - 1, base ? base + 1 : tmp);
+}
+
+/* A track's artist: tag artist if present, else the grandparent-folder fallback. */
+static void disco_artist_of(const disco_track *t, char *out, size_t n) {
+    const char *ar = disco_track_artist(t);
+    if (ar && ar[0]) { snprintf(out, n, "%.*s", (int)n - 1, ar); return; }
+    disco_grandparent_name(t->path, out, n);
 }
 
 static int disco_album_find(const char *album) {
@@ -1111,8 +1275,9 @@ static void disco_build_albums(void) {
             ai = g_album_count++;
             disco_album *al = &g_albums[ai];
             snprintf(al->album, sizeof(al->album), "%s", alb);
-            const char *ar = disco_track_artist(t);
-            snprintf(al->artist, sizeof(al->artist), "%s", (ar && ar[0]) ? ar : "Unknown Artist");
+            char ar[160];
+            disco_artist_of(t, ar, sizeof(ar));
+            snprintf(al->artist, sizeof(al->artist), "%s", ar[0] ? ar : "Unknown Artist");
             al->count = 0;
             al->art_track = i;
             al->cover_state = 0;   /* cover resolved lazily */
@@ -1120,8 +1285,9 @@ static void disco_build_albums(void) {
         disco_album *al = &g_albums[ai];
         if (al->count < (int)(sizeof(al->tracks) / sizeof(al->tracks[0])))
             al->tracks[al->count++] = i;
-        const char *ar = disco_track_artist(t);
-        if (ar && ar[0] && strcasecmp(al->artist, ar) != 0
+        char ar[160];
+        disco_artist_of(t, ar, sizeof(ar));
+        if (ar[0] && strcasecmp(al->artist, ar) != 0
                 && strcasecmp(al->artist, "Various Artists") != 0
                 && strcasecmp(al->artist, "Unknown Artist") != 0)
             snprintf(al->artist, sizeof(al->artist), "Various Artists");
@@ -1620,6 +1786,18 @@ static void disco_render_nowplaying(SDL_Rect content) {
                g.repeat == REPEAT_OFF ? th->hint : th->highlight);
 }
 
+/* SELECT overlay: the now-playing cover alone, maximized and centered, no chrome —
+   a "vinyl sleeve" view. Reuses the player's art (the vinyl placeholder if none).
+   Centers in the FULL screen, not the content rect: the overlay has no header/footer,
+   so it shouldn't inherit the content rect's reserved strips / asymmetric padding. */
+static void disco_render_art_only(void) {
+    int sw = cat_get_screen_width(), sh = cat_get_screen_height();
+    int m = cat_scale(16);
+    int side = (sw < sh ? sw : sh) - m * 2;
+    if (side < 1) side = 1;
+    disco_draw_art((sw - side) / 2, (sh - side) / 2, side);
+}
+
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
     memset(&g, 0, sizeof(g));
@@ -1695,11 +1873,10 @@ int main(int argc, char *argv[]) {
 
     int running = 1;
     while (running) {
-        /* Disco Boy always shows its own hint bar, regardless of Leaf's "show hints"
-           setting — so the layout is constant. */
+        /* The Library view draws Disco Boy's own hint bar (constant, regardless of
+           Leaf's "show hints" setting); the Player view is a clean, hint-less screen.
+           Reserving the bar's height and drawing it are decided per-view at render. */
         SDL_Rect content = cat_get_content_rect(true, false, false);
-        content.h -= disco_hint_reserved();
-        if (content.h < 0) content.h = 0;
 
         cat_input_event ev;
         while (cat_poll_input(&ev)) {
@@ -1709,10 +1886,28 @@ int main(int argc, char *argv[]) {
             }
             /* any other press stops a scrub, in case a trigger release is missed */
             if (ev.button != CAT_BTN_L2 && ev.button != CAT_BTN_R2) g_scrub = 0;
-            /* Quit is a deliberate button (MENU/SELECT), not B — so backing out of
+            /* Quit is a deliberate button (MENU), not B — so backing out of
                folders/albums can't drop you out of the app by accident. */
-            if ((ev.button == CAT_BTN_MENU || ev.button == CAT_BTN_SELECT) && !ev.repeated) {
+            if (ev.button == CAT_BTN_MENU && !ev.repeated) {
                 running = 0; continue;
+            }
+            /* SELECT toggles the full-screen cover overlay (and exits it again). */
+            if (ev.button == CAT_BTN_SELECT && !ev.repeated) {
+                g.art_only = !g.art_only; continue;
+            }
+            if (g.art_only) {
+                /* Sleeve view: playback stays controllable; B also exits; the rest
+                   is inert (no list/transport underneath to drive). */
+                switch (ev.button) {
+                    case CAT_BTN_B:  if (!ev.repeated) g.art_only = false; break;
+                    case CAT_BTN_X:  if (!ev.repeated) disco_toggle(); break;
+                    case CAT_BTN_L1: if (!ev.repeated) disco_prev(); break;
+                    case CAT_BTN_R1: if (!ev.repeated) disco_next(false); break;
+                    case CAT_BTN_L2: g_scrub = -1; g_scrub_next = 0; break;
+                    case CAT_BTN_R2: g_scrub = +1; g_scrub_next = 0; break;
+                    default: break;
+                }
+                continue;
             }
             if (g.view == VIEW_LIBRARY) {
                 switch (ev.button) {
@@ -1834,29 +2029,28 @@ int main(int argc, char *argv[]) {
         g_mq_anim = false;
 
         cat_clear_screen();
-        if (g.view == VIEW_LIBRARY) disco_render_library(content);
-        else                        disco_render_nowplaying(content);
-
-        if (g_hint_font) {
-            disco_draw_hints(g.view);
+        if (g.art_only) {
+            /* Full-screen cover overlay — clean, no chrome, full height. */
+            disco_render_art_only();
         } else if (g.view == VIEW_LIBRARY) {
-            cat_footer_item footer[] = {
-                { .button = CAT_BTN_L1, .label = "Prev" },
-                { .button = CAT_BTN_R1, .label = "Next" },
-                { .button = CAT_BTN_X,  .label = "Play/Pause" },
-                { .button = CAT_BTN_Y,  .label = "Now Playing" },
-                { .button = CAT_BTN_A,  .label = "Play", .is_confirm = true },
-            };
-            cat_draw_footer(footer, 5);
+            content.h -= disco_hint_reserved();   /* make room for the hint bar */
+            if (content.h < 0) content.h = 0;
+            disco_render_library(content);
+            if (g_hint_font) {
+                disco_draw_hints();
+            } else {
+                cat_footer_item footer[] = {
+                    { .button = CAT_BTN_L1, .label = "Prev" },
+                    { .button = CAT_BTN_R1, .label = "Next" },
+                    { .button = CAT_BTN_X,  .label = "Play/Pause" },
+                    { .button = CAT_BTN_Y,  .label = "Now Playing" },
+                    { .button = CAT_BTN_A,  .label = "Play", .is_confirm = true },
+                };
+                cat_draw_footer(footer, 5);
+            }
         } else {
-            cat_footer_item footer[] = {
-                { .button = CAT_BTN_L1, .label = "Prev" },
-                { .button = CAT_BTN_R1, .label = "Next" },
-                { .button = CAT_BTN_X,  .label = "Play/Pause" },
-                { .button = CAT_BTN_B,  .label = "List" },
-                { .button = CAT_BTN_A,  .label = "Select", .is_confirm = true },
-            };
-            cat_draw_footer(footer, 5);
+            /* Player: clean, hint-less view — uses the full content height (no bar). */
+            disco_render_nowplaying(content);
         }
         if (g_mq_anim) cat_request_frame();   /* 60fps active pacing while scrolling
                                                  (render-cost-corrected; matches the

@@ -59,16 +59,31 @@ jack or (dis)connect Bluetooth.
 | Y | toggle the now-playing screen |
 | L1 / R1 | switch tab |
 | L2 / R2 | hold to seek (-/+) |
+| SELECT | full-screen cover art (press again, or B, to close) |
 | MENU | quit |
 
 On the now-playing screen the transport is a full row - skip-prev / rewind /
 play-pause / forward / skip-next, with shuffle and repeat below; there L1 / R1 are
-previous / next track and L2 / R2 hold to seek.
+previous / next track and L2 / R2 hold to seek. The now-playing screen has no hint
+bar of its own: you reach it with Y from the list, so Y returns there, and the
+transport is on screen.
+
+SELECT opens a full-screen view of the current cover art with no other chrome -
+a "sleeve" view. SELECT again (or B) returns to where you were; playback controls
+(X, L1 / R1, L2 / R2, volume) stay live while it's up.
 
 ## Music location
 
 Tracks are read (recursively) from `$MUSIC_PATH`, else `$SDCARD_PATH/Music`, else
 `./Music`.
+
+The first launch reads tags + duration from every file (the slow part); the results
+are cached in a small binary file under `.discoboy/` on the card, keyed by path +
+mtime + size. Later launches serve unchanged files straight from the cache (no decoder
+open) and only re-read what's new or changed, so startup is near-instant at any library
+size. A steady-state launch writes nothing; a read-only card just falls back to a full
+scan. Before tags are in, the Artists view falls back to the grandparent folder name
+(the `Artist/` dir in an `Artist/Album/track` layout) so it reads sensibly immediately.
 
 ## Build
 

@@ -4,6 +4,9 @@ build/
 dist/
 .DS_Store
 
+# on-disk metadata cache (created beside the music dir on a native run)
+.discoboy/
+
 # personal test music — not part of the app
 Music/
 Fountains Of Wayne/
