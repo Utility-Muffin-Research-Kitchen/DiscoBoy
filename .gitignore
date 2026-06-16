@@ -13,3 +13,6 @@ Fountains Of Wayne/
 *.ogg
 *.wav
 *.opus
+
+# macOS screenshots dropped in the repo root
+/Screenshot*.png

@@ -818,9 +818,10 @@ static void disco_draw_meta_row(const disco_row *r, int x, int y, int w, int h, 
     int rx = x + w - cat_scale(12);
 
     /* album + artist rows get a cover thumbnail on the left (artist uses a cover
-       from one of its albums) */
+       from one of its albums). Sized to the full pill height and flush at pill_y
+       so the selection pill never peeks as a sliver above or below it. */
     if (r->type == ROW_ALBUM || r->type == ROW_ARTIST) {
-        int side = pill_h - cat_scale(2);
+        int side = pill_h;
         int album_ref = r->ref;
         if (r->type == ROW_ARTIST) {
             const disco_artist *art = &g_artists[r->ref];
@@ -831,9 +832,9 @@ static void disco_draw_meta_row(const disco_row *r, int x, int y, int w, int h, 
         if (corners == 0) corners = CAT_CORNER_ALL;
         int radius = (int)(th->pill_radius_ratio * side * 0.26f + 0.5f);
         if (thumb) {
-            cat_draw_image_rounded_ex(thumb, lx, pill_y + cat_scale(1), side, side, radius, corners);
-        } else if (g_record) {   /* no cover: the vinyl placeholder, shrunk */
-            cat_draw_image(g_record, lx, pill_y + cat_scale(1), side, side);
+            cat_draw_image_rounded_ex(thumb, lx, pill_y, side, side, radius, corners);
+        } else if (g_record) {   /* no cover: the vinyl placeholder */
+            cat_draw_image(g_record, lx, pill_y, side, side);
         }
         lx += side + cat_scale(10);
     }
@@ -1510,9 +1511,27 @@ static void disco_render_library(SDL_Rect content) {
     }
 }
 
+/* "Now Playing" title, tinted to the theme highlight to match the Library
+   wordmark. Mirrors cat_draw_screen_title's placement/sizing, just recolored. */
+static void disco_draw_np_title(void) {
+    ap_theme *th = cat_get_theme();
+    int margin = CAT_DS(15);   /* device_padding(10) + 5, as cat_draw_screen_title uses */
+    int max_w = cat_get_screen_width() - margin * 2;
+    if (max_w < 1) max_w = 1;
+    static const cat_font_tier tiers[] = { CAT_FONT_EXTRA_LARGE, CAT_FONT_LARGE, CAT_FONT_MEDIUM };
+    TTF_Font *font = NULL;
+    for (size_t i = 0; i < sizeof(tiers) / sizeof(tiers[0]); i++) {
+        TTF_Font *c = cat_get_font(tiers[i]);
+        if (!c) continue;
+        font = c;
+        if (cat_measure_text(c, "Now Playing") <= max_w) break;
+    }
+    if (font) cat_draw_text_clipped(font, "Now Playing", margin, 0, th->highlight, max_w);
+}
+
 static void disco_render_nowplaying(SDL_Rect content) {
     ap_theme *th = cat_get_theme();
-    cat_draw_screen_title("Now Playing", NULL);
+    disco_draw_np_title();
     disco_draw_output_chip(content);
     content = disco_top_rule(content);
 
@@ -1713,7 +1732,6 @@ int main(int argc, char *argv[]) {
                 }
             } else {
                 switch (ev.button) {
-                    case CAT_BTN_B:
                     case CAT_BTN_Y:     if (!ev.repeated) g.view = VIEW_LIBRARY; break;
                     /* focus slots: row1 0=prev 1=rewind 2=play/pause 3=fwd 4=next,
                        row2 5=shuffle 6=repeat. */
