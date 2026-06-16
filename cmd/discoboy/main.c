@@ -44,7 +44,8 @@
 #define DISCO_MAX_TRACKS 2048
 #define DISCO_MAX_PATH   1024
 
-#define DISCO_SEEK_STEP  10.0   /* seconds per scrub press */
+#define DISCO_SEEK_STEP  5.0    /* seconds per scrub step */
+#define DISCO_SCRUB_MS   130    /* repeat interval while a scrub trigger is held */
 
 /* Material Icons codepoints (UTF-8), rendered from the bundled subset font. */
 #define ICON_REWIND  "\xEE\x80\xA0"   /* fast_rewind  E020 */
@@ -92,9 +93,21 @@ static char     g_output[16] = "";         /* current output name, or "" before 
 static int      g_volume = -1;
 static uint32_t g_last_poll = 0;
 
+/* L2/R2 hold-to-scrub: triggers don't auto-repeat, so we seek on a timer while held */
+static int      g_scrub = 0;               /* -1 back, +1 forward, 0 idle */
+static uint32_t g_scrub_next = 0;          /* next scrub-seek deadline (ms) */
+
 /* bundled Material Icons subset, opened at two sizes for the transport */
 static TTF_Font *g_icons = NULL;
 static TTF_Font *g_icons_sm = NULL;
+
+/* the app draws its own hint bar at a fixed size (the launcher's font-size setting
+   bumps every tier, so Leaf's footer overflows at large sizes) - opened once from
+   the theme font at an unbumped small size. NULL => fall back to cat_draw_footer. */
+static TTF_Font *g_hint_font = NULL;
+
+/* Disco Boy wordmark for the title band (white, tinted to the theme text color). */
+static SDL_Texture *g_header = NULL;
 
 /* marquee state for overflowing text + per-frame delta */
 static cat_marquee g_mq_row, g_mq_title, g_mq_artist;
@@ -509,6 +522,117 @@ static void disco_draw_output_chip(SDL_Rect content) {
     cat_draw_text(small, lbl, cx + padx, cy + pady, th->hint);
 }
 
+/* Draw the Disco Boy wordmark in the title band, as-is, scaled to fit. Falls back
+   to the text title if the image is missing. */
+static void disco_draw_header(SDL_Rect content) {
+    int tw = 0, thh = 0;
+    if (!g_header || SDL_QueryTexture(g_header, NULL, NULL, &tw, &thh) != 0 || tw <= 0 || thh <= 0) {
+        cat_draw_screen_title("Disco Boy", NULL);
+        return;
+    }
+    int band = content.y;                 /* the title band is [0, content.y] */
+    int h = band - cat_scale(12);
+    if (h < cat_scale(14)) h = cat_scale(14);
+    int w = h * tw / thh;
+    int y = (band - h) / 2;
+    if (y < 0) y = 0;
+    cat_draw_image(g_header, cat_scale(12), y, w, h);
+}
+
+/* Thin divider under the title (matches the one above the hints); returns the
+   content rect pushed down below the rule. */
+static SDL_Rect disco_top_rule(SDL_Rect content) {
+    ap_theme *th = cat_get_theme();
+    int m = cat_scale(12);
+    int lh = cat_scale(1); if (lh < 1) lh = 1;
+    ap_color line = { th->text.r, th->text.g, th->text.b, 26 };
+    cat_draw_rect(m, content.y, cat_get_screen_width() - m * 2, lh, line);
+    int gap = cat_scale(10);
+    content.y += gap;
+    content.h -= gap;
+    if (content.h < 0) content.h = 0;
+    return content;
+}
+
+/* ---- our own hint bar (fixed size, so it fits at any launcher font size) ---- */
+
+typedef struct { const char *btn; const char *label; } disco_hint;
+
+static int disco_hint_btn_w(const char *btn, int pill_h) {
+    if (!btn || !btn[0]) return 0;
+    if (!btn[1]) return pill_h;                                  /* single char = square */
+    return pill_h / 2 + cat_measure_text(g_hint_font, btn);      /* L1 / R1 = wider */
+}
+
+static int disco_hint_group_w(const disco_hint *items, int n, int pill_h) {
+    int gap = cat_scale(6), item_gap = cat_scale(16);
+    int inner = 0;
+    for (int i = 0; i < n; i++) {
+        if (i) inner += item_gap;
+        inner += disco_hint_btn_w(items[i].btn, pill_h) + gap +
+                 cat_measure_text(g_hint_font, items[i].label);
+    }
+    return inner;
+}
+
+/* One hint group, drawn straight on the player background (no outer pill). The
+   confirm group (A) gets the highlight color; the rest get a faint fill — mirrors
+   the mockup's hint bar. */
+static void disco_draw_hint_group(const disco_hint *items, int n, int x0, int y, int pill_h,
+                                  bool confirm) {
+    ap_theme *th = cat_get_theme();
+    int gap = cat_scale(6), item_gap = cat_scale(16);
+    int fh = TTF_FontHeight(g_hint_font);
+    int inner_h = pill_h - cat_scale(6);
+    ap_color btn_bg = confirm ? th->highlight
+                              : (ap_color){ th->text.r, th->text.g, th->text.b, 28 };
+    ap_color btn_fg = confirm ? th->button_label : th->text;
+    int x = x0;
+    for (int i = 0; i < n; i++) {
+        if (i) x += item_gap;
+        int bw = disco_hint_btn_w(items[i].btn, pill_h);
+        disco_pill(x, y + (pill_h - inner_h) / 2, bw, inner_h, btn_bg);
+        int btw = cat_measure_text(g_hint_font, items[i].btn);
+        cat_draw_text(g_hint_font, items[i].btn, x + (bw - btw) / 2, y + (pill_h - fh) / 2, btn_fg);
+        x += bw + gap;
+        cat_draw_text(g_hint_font, items[i].label, x, y + (pill_h - fh) / 2, th->hint);
+        x += cat_measure_text(g_hint_font, items[i].label);
+    }
+}
+
+static int disco_hint_pill_h(void) { return TTF_FontHeight(g_hint_font) + cat_scale(10); }
+
+/* Vertical space the hint bar occupies (reserved out of the content rect). */
+static int disco_hint_reserved(void) {
+    if (!g_hint_font) return cat_get_footer_height();   /* fall back to Leaf's footer */
+    return disco_hint_pill_h() + cat_scale(16);
+}
+
+static void disco_draw_hints(disco_view view) {
+    if (!g_hint_font) return;
+    ap_theme *th = cat_get_theme();
+    int pill_h = disco_hint_pill_h();
+    int sw = cat_get_screen_width();
+    int m = cat_scale(12);
+    int y = cat_get_screen_height() - cat_scale(8) - pill_h;
+
+    /* a thin divider between the player UI and the hints */
+    int lh = cat_scale(1); if (lh < 1) lh = 1;
+    ap_color line = { th->text.r, th->text.g, th->text.b, 26 };
+    cat_draw_rect(m, y - cat_scale(8), sw - m * 2, lh, line);
+
+    static const disco_hint left[] = { {"L/R1","Track"}, {"L/R2","Seek"},
+                                       {"X","Pause"}, {"Y","View"} };
+    disco_draw_hint_group(left, 4, m, y, pill_h, false);
+    if (view == VIEW_LIBRARY) {
+        static const disco_hint right[] = { {"A","Play"} };
+        disco_draw_hint_group(right, 1, sw - m - disco_hint_group_w(right, 1, pill_h), y, pill_h, true);
+    } else {
+        static const disco_hint right[] = { {"A","Select"} };
+        disco_draw_hint_group(right, 1, sw - m - disco_hint_group_w(right, 1, pill_h), y, pill_h, true);
+    }
+}
+
 /* Compose "Album  ·  Year" (either part optional). */
 static void disco_album_year(const disco_track *t, char *out, size_t n) {
     const char *al = disco_track_album(t);
@@ -523,8 +647,9 @@ static void disco_album_year(const disco_track *t, char *out, size_t n) {
 
 static void disco_render_library(SDL_Rect content) {
     ap_theme *th = cat_get_theme();
-    cat_draw_screen_title("Disco Boy", NULL);
+    disco_draw_header(content);
     disco_draw_output_chip(content);
+    content = disco_top_rule(content);
 
     if (g.count == 0) {
         TTF_Font *small = cat_get_font(CAT_FONT_SMALL);
@@ -538,18 +663,27 @@ static void disco_render_library(SDL_Rect content) {
     cat_box page = { content.x, content.y, content.w, content.h, pad, pad, 0, pad };
     cat_box lb, rb;
     cat_box_split_cols(&page, cat_box_content(&page).w * 58 / 100, pad, &lb, &rb);
-    SDL_Rect L = cat_box_content(&lb), R = cat_box_content(&rb);
+    SDL_Rect R = cat_box_content(&rb);
 
     TTF_Font *med   = cat_get_font(CAT_FONT_MEDIUM);
     TTF_Font *small = cat_get_font(CAT_FONT_SMALL);
-    int item_h = TTF_FontHeight(med) + TTF_FontHeight(small) + CAT_S(12);
-    g.list.visible_rows = (item_h > 0 && L.h > 0) ? L.h / item_h : 1;
-    if (g.list.visible_rows < 1) g.list.visible_rows = 1;
+    /* fit_rows stretches the row pitch so the rows fill the pane exactly when the
+       list overflows (no remainder gap below the last row), like the launcher. */
+    int base_item_h = TTF_FontHeight(med) + TTF_FontHeight(small) + CAT_S(12);
+    int vis = 0, item_h = base_item_h;
+    SDL_Rect L = cat_box_fit_rows(&lb, base_item_h, g.count, &vis, &item_h);
+    g.list.visible_rows = vis;
     cat_draw_list_pane(L.x, L.y, L.w, L.h, g.count, &g.list, item_h, disco_draw_item, NULL);
 
-    /* right column: album art, then now-playing metadata + progress */
+    /* right column: art sized to leave room for the metadata + progress below it,
+       so the pane never bleeds into the hint bar (worst case = all lines present). */
+    int med_h = TTF_FontHeight(med), small_h = TTF_FontHeight(small);
+    int text_h = CAT_S(10) + med_h + CAT_S(2)
+               + (small_h + CAT_S(1)) * 2 + small_h + CAT_S(10)
+               + CAT_S(5) + CAT_S(4) + small_h;
     int side = R.w;
-    if (side > R.h * 55 / 100) side = R.h * 55 / 100;
+    if (side > R.h - text_h) side = R.h - text_h;
+    if (side < 0) side = 0;
     disco_draw_art(R.x + (R.w - side) / 2, R.y, side);
 
     int y = R.y + side + CAT_S(10);
@@ -583,6 +717,7 @@ static void disco_render_nowplaying(SDL_Rect content) {
     ap_theme *th = cat_get_theme();
     cat_draw_screen_title("Now Playing", NULL);
     disco_draw_output_chip(content);
+    content = disco_top_rule(content);
 
     TTF_Font *large = cat_get_font(CAT_FONT_LARGE);
     TTF_Font *med   = cat_get_font(CAT_FONT_MEDIUM);
@@ -600,8 +735,8 @@ static void disco_render_nowplaying(SDL_Rect content) {
     const disco_track *t = g.now_playing >= 0 ? &g.tracks[g.now_playing] : NULL;
     const char *title = t ? disco_track_title(t) : "Nothing playing";
 
-    int btn  = CAT_S(46);   /* top transport row */
-    int row2 = CAT_S(34);   /* shuffle/repeat row */
+    int btn  = CAT_S(84);   /* top transport row (larger glyphs) */
+    int row2 = CAT_S(58);   /* shuffle/repeat row */
     int est = TTF_FontHeight(large) * 2 + CAT_S(4) + TTF_FontHeight(med) +
               TTF_FontHeight(small) + CAT_S(16) + CAT_S(5) + CAT_S(4) +
               TTF_FontHeight(small) + CAT_S(18) + btn + CAT_S(14) + row2;
@@ -634,17 +769,17 @@ static void disco_render_nowplaying(SDL_Rect content) {
     /* transport — top row: rewind / play-pause / fast-forward (the sides scrub the
        track +/-10s); bottom row: shuffle / repeat. d-pad navigable: Left/Right within
        a row, Up/Down between rows, A activates. Glyphs = bundled Material Icons. */
-    int gap = CAT_S(20);
+    int gap = CAT_S(34);
     int cx  = I.x + I.w / 2;
     bool playing = disco_audio_is_playing();
     TTF_Font *ic  = g_icons    ? g_icons    : med;
     TTF_Font *ics = g_icons_sm ? g_icons_sm : small;
     int slot[3] = { cx - btn - gap, cx, cx + btn + gap };
-    int sx[2]   = { cx - CAT_S(30), cx + CAT_S(30) };   /* shuffle, repeat */
+    int sx[2]   = { cx - CAT_S(48), cx + CAT_S(48) };   /* shuffle, repeat */
     int row1_cy = y + btn / 2;
     int row2_cy = y + btn + CAT_S(14) + row2 / 2;
 
-    int fpad = CAT_S(6);
+    int fpad = CAT_S(8);
     ap_color halo = { th->highlight.r, th->highlight.g, th->highlight.b, 70 };
     if (g.np_focus <= 2)
         disco_pill(slot[g.np_focus] - btn / 2 - fpad, row1_cy - btn / 2 - fpad,
@@ -693,14 +828,27 @@ int main(int argc, char *argv[]) {
     disco_audio_init();
     srand((unsigned)time(NULL));
 
-    /* bundled Material Icons subset for the transport glyphs (two sizes) */
+    /* bundled Material Icons subset for the transport glyphs (two sizes) + the
+       Disco Boy wordmark for the title band */
     {
         const char *pd = getenv("DISCOBOY_PAK_DIR");
         char fp[DISCO_MAX_PATH];
         if (pd && pd[0]) snprintf(fp, sizeof(fp), "%s/res/media-icons.ttf", pd);
         else             snprintf(fp, sizeof(fp), "res/media-icons.ttf");
-        g_icons    = TTF_OpenFont(fp, cat_scale(30));
-        g_icons_sm = TTF_OpenFont(fp, cat_scale(22));
+        g_icons    = TTF_OpenFont(fp, cat_scale(60));
+        g_icons_sm = TTF_OpenFont(fp, cat_scale(42));
+        if (pd && pd[0]) snprintf(fp, sizeof(fp), "%s/res/header.png", pd);
+        else             snprintf(fp, sizeof(fp), "res/header.png");
+        g_header = cat_load_image(fp);
+    }
+    {
+        /* fixed-size hint font from the theme's UI font, ignoring the launcher's
+           font-size bump so our hint bar fits at any setting */
+        ap_theme *th = cat_get_theme();
+        if (th->font_path[0])
+            g_hint_font = TTF_OpenFont(th->font_path, cat_font_size_for_resolution(13));
+        cat_log("discoboy: hint font %s [%s]", g_hint_font ? "ok" : "fallback to leaf footer",
+                th->font_path[0] ? th->font_path : "no theme font path");
     }
 
     disco_resolve_music_dir(g.music_dir, sizeof(g.music_dir));
@@ -714,12 +862,20 @@ int main(int argc, char *argv[]) {
 
     int running = 1;
     while (running) {
-        bool show_hints = cat_hints_enabled_from_env();
-        SDL_Rect content = cat_get_content_rect(true, show_hints, false);
+        /* Disco Boy always shows its own hint bar, regardless of Leaf's "show hints"
+           setting — so the layout is constant. */
+        SDL_Rect content = cat_get_content_rect(true, false, false);
+        content.h -= disco_hint_reserved();
+        if (content.h < 0) content.h = 0;
 
         cat_input_event ev;
         while (cat_poll_input(&ev)) {
-            if (!ev.pressed) continue;
+            if (!ev.pressed) {
+                if (ev.button == CAT_BTN_L2 || ev.button == CAT_BTN_R2) g_scrub = 0;
+                continue;
+            }
+            /* any other press stops a scrub, in case a trigger release is missed */
+            if (ev.button != CAT_BTN_L2 && ev.button != CAT_BTN_R2) g_scrub = 0;
             if (g.view == VIEW_LIBRARY) {
                 switch (ev.button) {
                     case CAT_BTN_B:    if (!ev.repeated) running = 0; break;
@@ -727,9 +883,11 @@ int main(int argc, char *argv[]) {
                     case CAT_BTN_DOWN: cat_list_state_move(&g.list, +1, g.count); break;
                     case CAT_BTN_A:    if (!ev.repeated) disco_play(g.list.cursor); break;
                     case CAT_BTN_X:    if (!ev.repeated) disco_toggle(); break;
-                    case CAT_BTN_Y:    if (!ev.repeated && g.now_playing >= 0) g.view = VIEW_NOWPLAYING; break;
+                    case CAT_BTN_Y:    if (!ev.repeated) g.view = VIEW_NOWPLAYING; break;
                     case CAT_BTN_L1:   if (!ev.repeated) disco_prev(); break;
                     case CAT_BTN_R1:   if (!ev.repeated) disco_next(false); break;
+                    case CAT_BTN_L2:   g_scrub = -1; g_scrub_next = 0; break;   /* hold to scrub */
+                    case CAT_BTN_R2:   g_scrub = +1; g_scrub_next = 0; break;
                     default: break;
                 }
             } else {
@@ -758,9 +916,21 @@ int main(int argc, char *argv[]) {
                     case CAT_BTN_X:     if (!ev.repeated) disco_toggle(); break;
                     case CAT_BTN_L1:    if (!ev.repeated) disco_prev(); break;
                     case CAT_BTN_R1:    if (!ev.repeated) disco_next(false); break;
+                    case CAT_BTN_L2:    g_scrub = -1; g_scrub_next = 0; break;   /* hold to scrub */
+                    case CAT_BTN_R2:    g_scrub = +1; g_scrub_next = 0; break;
                     default: break;
                 }
             }
+        }
+
+        /* hold-to-scrub: while L2/R2 is held, seek a step every DISCO_SCRUB_MS */
+        if (g_scrub != 0) {
+            uint32_t tnow = SDL_GetTicks();
+            if (tnow >= g_scrub_next) {
+                disco_audio_seek(g_scrub * DISCO_SEEK_STEP);
+                g_scrub_next = tnow + DISCO_SCRUB_MS;
+            }
+            cat_request_frame_in(40);   /* keep ticking while held */
         }
 
         if (disco_audio_finished()) disco_next(true);
@@ -799,34 +969,36 @@ int main(int argc, char *argv[]) {
         if (g.view == VIEW_LIBRARY) disco_render_library(content);
         else                        disco_render_nowplaying(content);
 
-        if (show_hints) {
-            if (g.view == VIEW_LIBRARY) {
-                cat_footer_item footer[] = {
-                    { .button = CAT_BTN_L1, .label = "Prev" },
-                    { .button = CAT_BTN_R1, .label = "Next" },
-                    { .button = CAT_BTN_X,  .label = "Play/Pause" },
-                    { .button = CAT_BTN_Y,  .label = "Now Playing" },
-                    { .button = CAT_BTN_A,  .label = "Play", .is_confirm = true },
-                };
-                cat_draw_footer(footer, 5);
-            } else {
-                cat_footer_item footer[] = {
-                    { .button = CAT_BTN_L1, .label = "Prev" },
-                    { .button = CAT_BTN_R1, .label = "Next" },
-                    { .button = CAT_BTN_X,  .label = "Play/Pause" },
-                    { .button = CAT_BTN_B,  .label = "List" },
-                    { .button = CAT_BTN_A,  .label = "Select", .is_confirm = true },
-                };
-                cat_draw_footer(footer, 5);
-            }
+        if (g_hint_font) {
+            disco_draw_hints(g.view);
+        } else if (g.view == VIEW_LIBRARY) {
+            cat_footer_item footer[] = {
+                { .button = CAT_BTN_L1, .label = "Prev" },
+                { .button = CAT_BTN_R1, .label = "Next" },
+                { .button = CAT_BTN_X,  .label = "Play/Pause" },
+                { .button = CAT_BTN_Y,  .label = "Now Playing" },
+                { .button = CAT_BTN_A,  .label = "Play", .is_confirm = true },
+            };
+            cat_draw_footer(footer, 5);
+        } else {
+            cat_footer_item footer[] = {
+                { .button = CAT_BTN_L1, .label = "Prev" },
+                { .button = CAT_BTN_R1, .label = "Next" },
+                { .button = CAT_BTN_X,  .label = "Play/Pause" },
+                { .button = CAT_BTN_B,  .label = "List" },
+                { .button = CAT_BTN_A,  .label = "Select", .is_confirm = true },
+            };
+            cat_draw_footer(footer, 5);
         }
         if (g_mq_anim) cat_request_frame_in(33);   /* keep the marquee scrolling */
         cat_present();
     }
 
     if (g_meta_running) { g_meta_stop = true; pthread_join(g_meta_thread, NULL); }
-    if (g_icons)    TTF_CloseFont(g_icons);
-    if (g_icons_sm) TTF_CloseFont(g_icons_sm);
+    if (g_icons)     TTF_CloseFont(g_icons);
+    if (g_icons_sm)  TTF_CloseFont(g_icons_sm);
+    if (g_hint_font) TTF_CloseFont(g_hint_font);
+    if (g_header)    SDL_DestroyTexture(g_header);
     if (g.art) { SDL_DestroyTexture(g.art); g.art = NULL; }
     disco_audio_shutdown();
     cat_quit();
