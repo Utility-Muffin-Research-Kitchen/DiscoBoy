@@ -1,5 +1,10 @@
 # Disco Boy
 
+[![Release](https://img.shields.io/github/v/release/Utility-Muffin-Research-Kitchen/DiscoBoy?label=release&color=7FB069&labelColor=0F160E)](https://github.com/Utility-Muffin-Research-Kitchen/DiscoBoy/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/Utility-Muffin-Research-Kitchen/DiscoBoy/total?color=7FB069&labelColor=0F160E)](https://github.com/Utility-Muffin-Research-Kitchen/DiscoBoy/releases)
+[![License: MIT](https://img.shields.io/github/license/Utility-Muffin-Research-Kitchen/DiscoBoy?color=7FB069&labelColor=0F160E)](LICENSE)
+![Platform: Miniloong Pocket 1](https://img.shields.io/badge/platform-Miniloong%20Pocket%201-7FB069?labelColor=0F160E)
+
 A music player for [Leaf](https://github.com/Utility-Muffin-Research-Kitchen), the
 custom firmware for the Miniloong Pocket 1. Native [Catastrophe](https://github.com/Utility-Muffin-Research-Kitchen)
 app, packaged as a Leaf `.pak`. Named after the Frank Zappa track, to match the
