@@ -12,6 +12,16 @@ focused now-playing screen, and a play queue that follows whatever you played fr
 The MLP1's mono speaker is weak, so Disco Boy follows Leaf's audio routing and plays
 straight to a Bluetooth headset when one is connected.
 
+## Install
+
+Disco Boy is a standalone app, not bundled with Leaf. Grab the latest `.pak` from the
+[releases page](https://github.com/Utility-Muffin-Research-Kitchen/DiscoBoy/releases) and
+drop `DiscoBoy.pak` into the `Apps/mlp1/` folder on your Leaf SD card; it shows up in your
+Apps list. Put music under `Music/` on the card (see [Music location](#music-location)).
+
+Bluetooth audio is best with Wi-Fi off — the MLP1's RTL8723DS Wi-Fi/BT coexistence causes
+occasional dropouts, not an app bug.
+
 ## Browsing
 
 A tab bar across the top switches between three views (L1 / R1):
