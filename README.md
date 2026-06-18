@@ -75,7 +75,13 @@ jack or (dis)connect Bluetooth.
 | L1 / R1 | switch tab |
 | L2 / R2 | hold to seek (-/+) |
 | SELECT | full-screen cover art (press again, or B, to close) |
+| Stick click | lock the screen (pocket mode); click again to unlock |
 | MENU | quit |
+
+**Pocket mode.** Click the analog stick to lock: a padlock flashes, then the screen
+powers off and every button is ignored, so the player can ride in a pocket without
+skipping tracks or pausing. Music (and auto-advance to the next track) keeps playing.
+Click the stick again to wake the screen and unlock.
 
 On the now-playing screen the transport is a full row - skip-prev / rewind /
 play-pause / forward / skip-next, with shuffle and repeat below; there L1 / R1 are

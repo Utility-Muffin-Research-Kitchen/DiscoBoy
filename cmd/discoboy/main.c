@@ -32,6 +32,7 @@
 #include "disco_status.h"
 
 #include <dirent.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -116,6 +117,9 @@ static struct {
     bool           paused;
     disco_view     view;
     bool           art_only;               /* SELECT: full-screen cover, no chrome */
+    bool           locked;                 /* pocket lock: stick-click blanks screen + swallows input */
+    uint32_t       lock_anim_until;        /* ms ticks: flash the lock until here, then power the panel off */
+    bool           screen_off;             /* backlight currently powered down (bl_power) */
     disco_tab      tab;                    /* current browse tab */
     int            np_focus;               /* transport focus 0 rw, 1 play, 2 ff, 3 shuffle, 4 repeat */
     bool           shuffle;
@@ -1798,6 +1802,64 @@ static void disco_render_art_only(void) {
     disco_draw_art((sw - side) / 2, (sh - side) / 2, side);
 }
 
+/* Pocket lock flashes the padlock for this long, then powers the panel off. */
+#define DISCO_LOCK_FLASH_MS 1400
+
+/* Power the panel backlight off/on via the same sysfs knob the launcher uses
+   (FB_BLANK: 4 = powerdown, 0 = on). bl_power preserves the user's brightness and
+   loong_power won't fight it. Best-effort; the device runs us as root. */
+static void disco_set_screen(bool on) {
+    FILE *f = fopen("/sys/class/backlight/backlight/bl_power", "w");
+    if (!f) return;
+    fputc(on ? '0' : '4', f);
+    fclose(f);
+}
+
+/* Draw a solid padlock centered at (cx,cy) at brightness `v` (0..255), composed
+   from primitives so it needs no glyph font. Everything is fully opaque and drawn
+   on a black field — shackle, then a black hole-punch, then the body over the
+   shackle's base (so they merge into one solid lock), then a black keyhole. The
+   flash pulses `v`, not alpha, so the opaque layers composite cleanly. */
+static void disco_draw_lock(int cx, int cy, Uint8 v) {
+    cat_draw_color icon = (cat_draw_color){ v, v, v, 255 };
+    cat_draw_color hole = (cat_draw_color){ 0, 0, 0, 255 };
+    int thick = cat_scale(14);
+    int bw = cat_scale(132), bh = cat_scale(104);
+    int bx = cx - bw / 2, by = cy - bh / 2 + cat_scale(26);
+    int sw = cat_scale(84), shh = cat_scale(108);
+    int sx = cx - sw / 2, sy = by - cat_scale(58);
+    cat_draw_rounded_rect(sx, sy, sw, shh, sw / 2, icon);                               /* shackle */
+    cat_draw_rounded_rect(sx + thick, sy + thick, sw - 2 * thick, shh, (sw - 2 * thick) / 2, hole);
+    cat_draw_rounded_rect(bx, by, bw, bh, cat_scale(18), icon);                         /* body */
+    cat_draw_circle(cx, by + bh * 4 / 10, cat_scale(12), hole);                         /* keyhole */
+    cat_draw_rounded_rect(cx - cat_scale(4), by + bh * 4 / 10, cat_scale(8), cat_scale(24), cat_scale(4), hole);
+}
+
+/* The lock baked once into a transparent texture (opaque white on a clear field),
+   so the flash can fade the whole solid shape uniformly via one alpha mod — no
+   internal seams between the hasp and the body. */
+static SDL_Texture *g_lock_tex = NULL;
+static int g_lock_w = 0, g_lock_h = 0;
+static SDL_Texture *disco_lock_texture(void) {
+    if (g_lock_tex) return g_lock_tex;
+    SDL_Renderer *r = cat_get_renderer();
+    int pad = cat_scale(6), bw = cat_scale(132), bh = cat_scale(104);
+    g_lock_w = bw + 2 * pad;
+    g_lock_h = bh + cat_scale(58) + 2 * pad;
+    SDL_Texture *t = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA8888,
+                                       SDL_TEXTUREACCESS_TARGET, g_lock_w, g_lock_h);
+    if (!t) return NULL;
+    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+    SDL_Texture *prev = SDL_GetRenderTarget(r);
+    SDL_SetRenderTarget(r, t);
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 0);
+    SDL_RenderClear(r);
+    disco_draw_lock(pad + bw / 2, pad + bh / 2 + cat_scale(32), 255);   /* solid white */
+    SDL_SetRenderTarget(r, prev);
+    g_lock_tex = t;
+    return t;
+}
+
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
     memset(&g, 0, sizeof(g));
@@ -1880,6 +1942,20 @@ int main(int argc, char *argv[]) {
 
         cat_input_event ev;
         while (cat_poll_input(&ev)) {
+            /* Pocket lock: an analog-stick (L3) click toggles a locked state that
+               swallows every other button, so the player can ride in a pocket
+               without firing buttons; the screen goes black while locked. Audio and
+               auto-advance keep running. The same click unlocks and restores the UI. */
+            if (ev.button == CAT_BTN_STICK) {
+                if (ev.pressed && !ev.repeated) {
+                    g.locked = !g.locked;
+                    g_scrub = 0;
+                    if (g.locked) g.lock_anim_until = SDL_GetTicks() + DISCO_LOCK_FLASH_MS;
+                    cat_request_frame();   /* repaint now: flash on lock, UI on unlock */
+                }
+                continue;
+            }
+            if (g.locked) continue;        /* locked: ignore everything but the stick */
             if (!ev.pressed) {
                 if (ev.button == CAT_BTN_L2 || ev.button == CAT_BTN_R2) g_scrub = 0;
                 continue;
@@ -2028,6 +2104,33 @@ int main(int argc, char *argv[]) {
         }
         g_mq_anim = false;
 
+        if (g.locked) {
+            /* Pocket lock. First flash a padlock on black (panel still lit) as
+               confirmation, then power the backlight off entirely. Playback and
+               auto-advance keep running above; a stick click unlocks. */
+            SDL_Renderer *rend = cat_get_renderer();
+            SDL_SetRenderDrawColor(rend, 0, 0, 0, 255);
+            SDL_RenderClear(rend);
+            uint32_t tnow = SDL_GetTicks();
+            if (tnow < g.lock_anim_until) {
+                float since = (float)(tnow - (g.lock_anim_until - DISCO_LOCK_FLASH_MS));
+                float pulse = 0.5f * (1.0f + sinf(since / 1000.0f * 2.0f * (float)M_PI * 1.7f));
+                SDL_Texture *lt = disco_lock_texture();
+                if (lt) {
+                    int sw, sh; SDL_GetRendererOutputSize(rend, &sw, &sh);
+                    SDL_Rect dst = { sw / 2 - g_lock_w / 2, sh / 2 - g_lock_h / 2, g_lock_w, g_lock_h };
+                    SDL_SetTextureAlphaMod(lt, (Uint8)(255.0f * pulse));   /* fade the whole solid lock */
+                    SDL_RenderCopy(rend, lt, NULL, &dst);
+                }
+                cat_present();
+                cat_request_frame_in(30);            /* animate the flash */
+            } else {
+                cat_present();                       /* black */
+                if (!g.screen_off) { disco_set_screen(false); g.screen_off = true; }
+            }
+            continue;
+        }
+        if (g.screen_off) { disco_set_screen(true); g.screen_off = false; }   /* just unlocked */
         cat_clear_screen();
         if (g.art_only) {
             /* Full-screen cover overlay — clean, no chrome, full height. */
@@ -2068,6 +2171,8 @@ int main(int argc, char *argv[]) {
     if (g_album_hero) SDL_DestroyTexture(g_album_hero);
     if (g.art) { SDL_DestroyTexture(g.art); g.art = NULL; }
     disco_audio_shutdown();
+    if (g.screen_off) disco_set_screen(true);   /* never leave the panel dark on exit */
+    if (g_lock_tex) SDL_DestroyTexture(g_lock_tex);
     cat_quit();
     return 0;
 }
