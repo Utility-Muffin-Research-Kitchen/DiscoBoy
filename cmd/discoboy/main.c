@@ -29,6 +29,7 @@
 #include "disco_audio.h"
 #include "disco_ff.h"
 #include "disco_meta.h"
+#include "disco_sources.h"
 #include "disco_status.h"
 
 #include <dirent.h>
@@ -72,6 +73,8 @@ typedef struct {
     char         name[256];          /* raw filename, used for sort order */
     char         title[256];         /* prettified filename (fallback title) */
     char         path[DISCO_MAX_PATH];
+    char         source_id[32];
+    int          source_idx;
     disco_meta   meta;               /* tags + duration, filled by the worker */
     long long    mtime;              /* file mtime + size: cache key (set by worker) */
     long long    size;
@@ -81,7 +84,7 @@ typedef struct {
 /* A row in the current browse list: a playable track, or an album / folder you
    drill into. Albums and folders are far fewer than tracks, so the array is
    sized to the track ceiling and the heavier per-row text is kept small. */
-typedef enum { ROW_TRACK = 0, ROW_ALBUM, ROW_FOLDER, ROW_ARTIST } disco_rowtype;
+typedef enum { ROW_TRACK = 0, ROW_ALBUM, ROW_FOLDER, ROW_ARTIST, ROW_SOURCE } disco_rowtype;
 typedef struct {
     disco_rowtype type;
     int  ref;            /* ROW_TRACK: g.tracks idx; ROW_ALBUM: album idx; ROW_ARTIST: artist idx */
@@ -109,7 +112,7 @@ typedef struct {
 } disco_artist;
 
 static struct {
-    char           music_dir[DISCO_MAX_PATH];
+    disco_sources  sources;
     disco_track    tracks[DISCO_MAX_TRACKS];
     int            count;
     cat_list_state list;
@@ -128,6 +131,7 @@ static struct {
     char           art_dir[DISCO_MAX_PATH];/* folder the cover was last resolved for */
     /* browse state */
     char           folder_dir[DISCO_MAX_PATH]; /* Folders tab: current directory */
+    int            folder_source;              /* selected source, or -1 for source list */
     int            artist_open;            /* Artists tab: drilled-in artist idx, or -1 */
     int            album_open;             /* drilled-in album idx, or -1 */
 } g;
@@ -259,7 +263,7 @@ static int disco_cmp(const void *a, const void *b) {
 
 /* Recurse a folder tree, collecting audio files (albums in subfolders are found,
    and per-folder cover art / folder labels then work for each album). */
-static void disco_scan_dir(const char *dir, int depth) {
+static void disco_scan_dir(const char *dir, int depth, int source_idx) {
     if (depth > 6 || g.count >= DISCO_MAX_TRACKS) return;
     DIR *d = opendir(dir);
     if (!d) return;
@@ -281,10 +285,12 @@ static void disco_scan_dir(const char *dir, int depth) {
         }
 
         if (is_dir) {
-            disco_scan_dir(full, depth + 1);
+            disco_scan_dir(full, depth + 1, source_idx);
         } else if (is_reg && disco_is_audio(e->d_name)) {
             disco_track *t = &g.tracks[g.count];
             snprintf(t->path, sizeof(t->path), "%s", full);
+            memcpy(t->source_id, g.sources.items[source_idx].id, sizeof(t->source_id));
+            t->source_idx = source_idx;
             snprintf(t->name, sizeof(t->name), "%s", e->d_name);
             disco_prettify(e->d_name, t->title, sizeof(t->title));
             t->meta_ready = 0;
@@ -295,22 +301,12 @@ static void disco_scan_dir(const char *dir, int depth) {
     closedir(d);
 }
 
-static void disco_scan(const char *dir) {
+static void disco_scan(void) {
     g.count = 0;
-    disco_scan_dir(dir, 0);
+    for (int i = 0; i < g.sources.count && g.count < DISCO_MAX_TRACKS; i++) {
+        if (g.sources.items[i].available) disco_scan_dir(g.sources.items[i].root, 0, i);
+    }
     qsort(g.tracks, (size_t)g.count, sizeof(disco_track), disco_cmp);
-}
-
-/* music dir: $MUSIC_PATH, then $SDCARD_PATH/Music, then ./Music */
-static void disco_resolve_music_dir(char *out, size_t n) {
-    const char *m = getenv("MUSIC_PATH");
-    const char *sd = getenv("SDCARD_PATH");
-    if (m && m[0])       snprintf(out, n, "%s", m);
-    else if (sd && sd[0]) snprintf(out, n, "%s/Music", sd);
-    else                  snprintf(out, n, "Music");
-    /* drop a trailing slash so path-prefix compares (grandparent fallback) hold */
-    size_t l = strlen(out);
-    while (l > 1 && out[l - 1] == '/') out[--l] = '\0';
 }
 
 /* ---- on-disk metadata cache --------------------------------------------------
@@ -338,13 +334,14 @@ typedef struct {
 static disco_cache_rec *g_cache = NULL;
 static int              g_cache_count = 0;
 
-/* Resolve the cache file path under a hidden .discoboy dir on the SD (or, with no
-   SDCARD_PATH, beside the music dir — that dotdir is skipped by the scan). */
+/* Resolve the cache under Leaf's durable userdata root. Direct launches fall
+   back beside the primary Music source; the cache never lives on card two. */
 static bool disco_cache_file(char *out, size_t n) {
-    const char *sd = getenv("SDCARD_PATH");
-    const char *base = (sd && sd[0]) ? sd : g.music_dir;
-    char dir[DISCO_MAX_PATH + 16];
-    if ((size_t)snprintf(dir, sizeof(dir), "%s/.discoboy", base) >= sizeof(dir)) return false;
+    const char *userdata = getenv("USERDATA_PATH");
+    const char *base = (userdata && userdata[0]) ? userdata
+                      : (g.sources.count > 0 ? g.sources.items[0].root : ".");
+    char dir[DISCO_MAX_PATH + 32];
+    if ((size_t)snprintf(dir, sizeof(dir), "%s/DiscoBoy", base) >= sizeof(dir)) return false;
     mkdir(dir, 0777);   /* best effort; harmless if it already exists */
     return (size_t)snprintf(out, n, "%s/library.cache", dir) < n;
 }
@@ -545,6 +542,22 @@ static double disco_track_duration(const disco_track *t) {
     if (r) __sync_synchronize();
     return r ? t->meta.duration : 0.0;
 }
+
+static bool disco_track_needs_source_label(int tidx) {
+    const disco_track *t = &g.tracks[tidx];
+    const char *title = disco_track_title(t);
+    const char *artist = disco_track_artist(t);
+    const char *album = (t->meta_ready && t->meta.album[0]) ? t->meta.album : "";
+    for (int i = 0; i < g.count; i++) {
+        if (i == tidx || g.tracks[i].source_idx == t->source_idx) continue;
+        const disco_track *other = &g.tracks[i];
+        const char *other_album = (other->meta_ready && other->meta.album[0]) ? other->meta.album : "";
+        if (strcasecmp(title, disco_track_title(other)) == 0 &&
+            strcasecmp(artist, disco_track_artist(other)) == 0 &&
+            strcasecmp(album, other_album) == 0) return true;
+    }
+    return false;
+}
 static int disco_track_num(const disco_track *t) {
     bool r = t->meta_ready;
     if (r) __sync_synchronize();
@@ -554,7 +567,9 @@ static int disco_track_num(const disco_track *t) {
 /* Folder name of the now-playing track (album-tag fallback / library hint). */
 static const char *disco_folder_label(void) {
     if (g.now_playing < 0) return "";
-    if (strcmp(g.art_dir, g.music_dir) == 0) return "";
+    const disco_track *t = &g.tracks[g.now_playing];
+    if (t->source_idx >= 0 && t->source_idx < g.sources.count &&
+        strcmp(g.art_dir, g.sources.items[t->source_idx].root) == 0) return "";
     const char *slash = strrchr(g.art_dir, '/');
     return slash && slash[1] ? slash + 1 : "";
 }
@@ -910,6 +925,13 @@ static void disco_draw_track_row(int tidx, int x, int y, int w, int h, bool sele
         : th->hint;
 
     const char *artist = disco_track_artist(t);
+    char source_sub[320];
+    if (disco_track_needs_source_label(tidx) && t->source_idx >= 0 && t->source_idx < g.sources.count) {
+        if (artist[0]) snprintf(source_sub, sizeof(source_sub), "%s  \xC2\xB7  %s",
+                                artist, g.sources.items[t->source_idx].label);
+        else snprintf(source_sub, sizeof(source_sub), "%s", g.sources.items[t->source_idx].label);
+        artist = source_sub;
+    }
     double dur = disco_track_duration(t);
     char durs[16] = "";
     int dw = 0, dh = 0;
@@ -1193,17 +1215,18 @@ static void disco_album_of(const disco_track *t, char *out, size_t n) {
    app opens, before the metadata worker has filled tags in. Loose tracks and album
    folders sitting directly under the music root have no artist dir -> "" (Unknown
    Artist). Replaced by the real tag for each track as the worker publishes it. */
-static void disco_grandparent_name(const char *path, char *out, size_t n) {
+static void disco_grandparent_name(const disco_track *track, char *out, size_t n) {
     out[0] = '\0';
     char tmp[DISCO_MAX_PATH];
-    snprintf(tmp, sizeof(tmp), "%s", path);
+    snprintf(tmp, sizeof(tmp), "%s", track->path);
     char *slash = strrchr(tmp, '/');     /* drop filename  -> parent (album) dir */
     if (!slash) return;
     *slash = '\0';
     slash = strrchr(tmp, '/');           /* drop album dir -> grandparent (artist) */
     if (!slash) return;
     *slash = '\0';
-    if (strcmp(tmp, g.music_dir) == 0) return;   /* album folder sits at music root */
+    if (track->source_idx >= 0 && track->source_idx < g.sources.count &&
+        strcmp(tmp, g.sources.items[track->source_idx].root) == 0) return;
     const char *base = strrchr(tmp, '/');
     snprintf(out, n, "%.*s", (int)n - 1, base ? base + 1 : tmp);
 }
@@ -1212,12 +1235,13 @@ static void disco_grandparent_name(const char *path, char *out, size_t n) {
 static void disco_artist_of(const disco_track *t, char *out, size_t n) {
     const char *ar = disco_track_artist(t);
     if (ar && ar[0]) { snprintf(out, n, "%.*s", (int)n - 1, ar); return; }
-    disco_grandparent_name(t->path, out, n);
+    disco_grandparent_name(t, out, n);
 }
 
-static int disco_album_find(const char *album) {
+static int disco_album_find(const char *album, const char *artist) {
     for (int i = 0; i < g_album_count; i++)
-        if (strcasecmp(g_albums[i].album, album) == 0) return i;
+        if (disco_album_identity_equal(g_albums[i].album, g_albums[i].artist,
+                                       album, artist)) return i;
     return -1;
 }
 /* Album track order: by track-number tag when both have one, else by filename
@@ -1273,15 +1297,16 @@ static void disco_build_albums(void) {
         char alb[160];
         disco_album_of(t, alb, sizeof(alb));
         if (!alb[0]) snprintf(alb, sizeof(alb), "Unknown Album");
-        int ai = disco_album_find(alb);
+        char ar[160];
+        disco_artist_of(t, ar, sizeof(ar));
+        if (!ar[0]) snprintf(ar, sizeof(ar), "Unknown Artist");
+        int ai = disco_album_find(alb, ar);
         if (ai < 0) {
             if (g_album_count >= (int)(sizeof(g_albums) / sizeof(g_albums[0]))) continue;
             ai = g_album_count++;
             disco_album *al = &g_albums[ai];
             snprintf(al->album, sizeof(al->album), "%s", alb);
-            char ar[160];
-            disco_artist_of(t, ar, sizeof(ar));
-            snprintf(al->artist, sizeof(al->artist), "%s", ar[0] ? ar : "Unknown Artist");
+            snprintf(al->artist, sizeof(al->artist), "%s", ar);
             al->count = 0;
             al->art_track = i;
             al->cover_state = 0;   /* cover resolved lazily */
@@ -1289,12 +1314,6 @@ static void disco_build_albums(void) {
         disco_album *al = &g_albums[ai];
         if (al->count < (int)(sizeof(al->tracks) / sizeof(al->tracks[0])))
             al->tracks[al->count++] = i;
-        char ar[160];
-        disco_artist_of(t, ar, sizeof(ar));
-        if (ar[0] && strcasecmp(al->artist, ar) != 0
-                && strcasecmp(al->artist, "Various Artists") != 0
-                && strcasecmp(al->artist, "Unknown Artist") != 0)
-            snprintf(al->artist, sizeof(al->artist), "Various Artists");
     }
     for (int i = 0; i < g_album_count; i++)
         qsort(g_albums[i].tracks, (size_t)g_albums[i].count, sizeof(int), disco_name_cmp);
@@ -1360,10 +1379,43 @@ static void disco_rows_artist_albums(int arti) {
     }
 }
 
+static int disco_available_source_count(void) {
+    int count = 0;
+    for (int i = 0; i < g.sources.count; i++) if (g.sources.items[i].available) count++;
+    return count;
+}
+
+static void disco_reset_folder_browser(void) {
+    g.folder_source = -1;
+    g.folder_dir[0] = '\0';
+    if (disco_available_source_count() == 1) {
+        for (int i = 0; i < g.sources.count; i++) {
+            if (!g.sources.items[i].available) continue;
+            g.folder_source = i;
+            snprintf(g.folder_dir, sizeof(g.folder_dir), "%s", g.sources.items[i].root);
+            break;
+        }
+    }
+}
+
 /* Folders tab: immediate subfolders (drill-in) then direct tracks of folder_dir,
    derived from the scanned track paths (no extra filesystem walk). */
 static void disco_rows_folders(void) {
     g_rowcount = 0;
+    if (g.folder_source < 0) {
+        for (int i = 0; i < g.sources.count && g_rowcount < DISCO_MAX_TRACKS; i++) {
+            if (!g.sources.items[i].available) continue;
+            int tracks = 0;
+            for (int j = 0; j < g.count; j++) if (g.tracks[j].source_idx == i) tracks++;
+            disco_row *r = &g_rows[g_rowcount++];
+            r->type = ROW_SOURCE;
+            r->ref = i;
+            snprintf(r->label, sizeof(r->label), "%s", g.sources.items[i].label);
+            snprintf(r->sub, sizeof(r->sub), "%d track%s  \xC2\xB7  %s",
+                     tracks, tracks == 1 ? "" : "s", g.sources.items[i].root);
+        }
+        return;
+    }
     const char *dir = g.folder_dir;
     size_t dlen = strlen(dir);
     for (int i = 0; i < g.count && g_rowcount < DISCO_MAX_TRACKS; i++) {     /* subfolders */
@@ -1431,7 +1483,8 @@ static void disco_set_tab(int delta) {
     g.tab = (disco_tab)(((int)g.tab + delta + TAB_COUNT) % TAB_COUNT);
     g.artist_open = -1;
     g.album_open = -1;
-    snprintf(g.folder_dir, sizeof(g.folder_dir), "%s", g.music_dir);
+    g.folder_source = -1;
+    disco_reset_folder_browser();
     disco_rebuild_rows();
     disco_pin_now_playing();   /* surface the playing track if this tab contains it */
 }
@@ -1455,6 +1508,11 @@ static void disco_row_activate(int i) {
     if (r->type == ROW_TRACK)        disco_play_row_track(i);
     else if (r->type == ROW_ARTIST)  { g.artist_open = r->ref; disco_rebuild_rows(); }
     else if (r->type == ROW_ALBUM)   { g.album_open = r->ref; disco_rebuild_rows(); }
+    else if (r->type == ROW_SOURCE) {
+        g.folder_source = r->ref;
+        snprintf(g.folder_dir, sizeof(g.folder_dir), "%s", g.sources.items[r->ref].root);
+        disco_rebuild_rows();
+    }
     else if (r->type == ROW_FOLDER) {
         size_t fl = strlen(g.folder_dir);
         if (fl + 2 < sizeof(g.folder_dir))
@@ -1523,7 +1581,8 @@ static bool disco_browse_back(void) {
         disco_cursor_to_album(name);
         return true;
     }
-    if (g.tab == TAB_FOLDERS && strcmp(g.folder_dir, g.music_dir) != 0) {
+    if (g.tab == TAB_FOLDERS && g.folder_source >= 0 &&
+        strcmp(g.folder_dir, g.sources.items[g.folder_source].root) != 0) {
         char came[256] = "";
         char *slash = strrchr(g.folder_dir, '/');
         if (slash) { snprintf(came, sizeof(came), "%s", slash + 1); *slash = '\0'; }
@@ -1533,6 +1592,12 @@ static bool disco_browse_back(void) {
                 cat_list_state_jump(&g.list, i, g_rowcount);
                 break;
             }
+        return true;
+    }
+    if (g.tab == TAB_FOLDERS && g.folder_source >= 0 && disco_available_source_count() > 1) {
+        g.folder_source = -1;
+        g.folder_dir[0] = '\0';
+        disco_rebuild_rows();
         return true;
     }
     return false;
@@ -1570,8 +1635,8 @@ static void disco_render_library(SDL_Rect content) {
 
     if (g.count == 0) {
         TTF_Font *small = cat_get_font(CAT_FONT_SMALL);
-        char msg[DISCO_MAX_PATH + 64];
-        snprintf(msg, sizeof(msg), "No music found in %s", g.music_dir);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "No music found on mounted Music sources");
         cat_draw_text(small, msg, content.x + CAT_S(12), content.y + CAT_S(12), th->hint);
         return;
     }
@@ -1625,11 +1690,14 @@ static void disco_render_library(SDL_Rect content) {
         snprintf(crumb, sizeof(crumb), "\xE2\x80\xB9 %s", g_artists[g.artist_open].artist);
         disco_text(med, crumb, LB.x + CAT_S(2), listy, th->text, LB.w - CAT_S(4), &g_mq_header);
         listy += TTF_FontHeight(med) + CAT_S(4);
-    } else if (g.tab == TAB_FOLDERS && strcmp(g.folder_dir, g.music_dir) != 0) {
-        const char *rel = g.folder_dir + strlen(g.music_dir);
+    } else if (g.tab == TAB_FOLDERS && g.folder_source >= 0) {
+        const char *root = g.sources.items[g.folder_source].root;
+        const char *rel = g.folder_dir + strlen(root);
         if (*rel == '/') rel++;
         char crumb[DISCO_MAX_PATH];
-        snprintf(crumb, sizeof(crumb), "\xE2\x80\xB9 %s", rel);
+        if (*rel) snprintf(crumb, sizeof(crumb), "\xE2\x80\xB9 %s / %s",
+                           g.sources.items[g.folder_source].label, rel);
+        else snprintf(crumb, sizeof(crumb), "%s", g.sources.items[g.folder_source].label);
         cat_draw_text_ellipsized(small, crumb, LB.x + CAT_S(2), listy, th->hint, LB.w - CAT_S(4));
         listy += TTF_FontHeight(small) + CAT_S(4);
     }
@@ -1919,10 +1987,19 @@ int main(int argc, char *argv[]) {
                 th->font_path[0] ? th->font_path : "no theme font path");
     }
 
-    disco_resolve_music_dir(g.music_dir, sizeof(g.music_dir));
-    disco_scan(g.music_dir);
-    cat_log("discoboy: %d tracks in %s", g.count, g.music_dir);
-    snprintf(g.folder_dir, sizeof(g.folder_dir), "%s", g.music_dir);
+    char source_error[256];
+    if (!disco_sources_resolve(&g.sources, source_error, sizeof(source_error))) {
+        cat_log("discoboy: invalid Music sources: %s", source_error);
+        disco_audio_shutdown();
+        cat_quit();
+        return 1;
+    }
+    disco_scan();
+    for (int i = 0; i < g.sources.count; i++)
+        cat_log("discoboy: source %s root=%s available=%d", g.sources.items[i].id,
+                g.sources.items[i].root, g.sources.items[i].available);
+    cat_log("discoboy: %d tracks across %d configured source(s)", g.count, g.sources.count);
+    disco_reset_folder_browser();
     disco_rebuild_rows();
 
     if (g.count > 0 && pthread_create(&g_meta_thread, NULL, disco_meta_worker, NULL) == 0)

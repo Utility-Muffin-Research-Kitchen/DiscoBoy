@@ -30,7 +30,7 @@ LDFLAGS  := -L$(SYSROOT)/usr/lib -lSDL2 -lSDL2_ttf -lSDL2_image -lasound -lm -lp
 # Each decoder's IMPLEMENTATION lives in its own TU (compiled -w); disco_audio.c
 # includes only the declaration side of each header (stb_vorbis via HEADER_ONLY).
 OBJ := $(OBJDIR)/main.o $(OBJDIR)/disco_audio.o $(OBJDIR)/disco_ff.o $(OBJDIR)/disco_meta.o \
-       $(OBJDIR)/disco_status.o \
+	   $(OBJDIR)/disco_status.o $(OBJDIR)/disco_sources.o \
        $(OBJDIR)/dr_wav_impl.o $(OBJDIR)/dr_mp3_impl.o $(OBJDIR)/dr_flac_impl.o \
        $(OBJDIR)/stb_vorbis.o $(OBJDIR)/cJSON.o
 
@@ -50,6 +50,8 @@ $(OBJDIR)/disco_ff.o: $(SRC)/disco_ff.c | $(OBJDIR)
 $(OBJDIR)/disco_meta.o: $(SRC)/disco_meta.c | $(OBJDIR)
 	$(CC) $(APP_CFLAGS) -c -o $@ $<
 $(OBJDIR)/disco_status.o: $(SRC)/disco_status.c | $(OBJDIR)
+	$(CC) $(APP_CFLAGS) -c -o $@ $<
+$(OBJDIR)/disco_sources.o: $(SRC)/disco_sources.c | $(OBJDIR)
 	$(CC) $(APP_CFLAGS) -c -o $@ $<
 $(OBJDIR)/dr_wav_impl.o: $(SRC)/dr_wav_impl.c | $(OBJDIR)
 	$(CC) $(VENDOR_CFLAGS) -c -o $@ $<

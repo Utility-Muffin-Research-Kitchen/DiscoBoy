@@ -19,10 +19,10 @@ straight to a Bluetooth headset when one is connected.
 
 ## Install
 
-Disco Boy is a standalone app, not bundled with Leaf. Grab the latest `.pak` from the
-[releases page](https://github.com/Utility-Muffin-Research-Kitchen/DiscoBoy/releases) and
-drop `DiscoBoy.pak` into the `Apps/mlp1/` folder on your Leaf SD card; it shows up in your
-Apps list. Put music under `Music/` on the card (see [Music location](#music-location)).
+Disco Boy is a standalone Pak Rat app and is not bundled with Leaf's default payload.
+Its Pak Rat catalog entry will be published only after the release artifact passes the
+full Leaf verification gate. Put music under `Music/` on either SD card (see
+[Music location](#music-location)).
 
 Bluetooth audio is best with Wi-Fi off — the MLP1's RTL8723DS Wi-Fi/BT coexistence causes
 occasional dropouts, not an app bug.
@@ -95,11 +95,20 @@ a "sleeve" view. SELECT again (or B) returns to where you were; playback control
 
 ## Music location
 
-Tracks are read (recursively) from `$MUSIC_PATH`, else `$SDCARD_PATH/Music`, else
-`./Music`.
+Tracks are read recursively from every root in ordered `$MUSIC_PATHS`. Leaf publishes
+the primary card first and the secondary card second; an absent secondary card is
+skipped without hiding the primary library. Direct launches fall back to `$MUSIC_PATH`,
+then `$SDCARD_PATH/Music`, then `./Music`. Duplicate roots and malformed colon lists are
+rejected so the same physical files cannot appear twice merely because a card was
+configured twice.
+
+Artists and Albums merge matching metadata across cards while retaining both physical
+tracks. A compact `SD1` or `SD2` label appears only when otherwise-identical tracks need
+disambiguation. Folders remain source-local: with both cards mounted, open `SD1` or
+`SD2` first and then browse that card's real directory tree.
 
 The first launch reads tags + duration from every file (the slow part); the results
-are cached in a small binary file under `.discoboy/` on the card, keyed by path +
+are cached in a small binary file under `$USERDATA_PATH/DiscoBoy/`, keyed by path +
 mtime + size. Later launches serve unchanged files straight from the cache (no decoder
 open) and only re-read what's new or changed, so startup is near-instant at any library
 size. A steady-state launch writes nothing; a read-only card just falls back to a full
