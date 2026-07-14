@@ -7,7 +7,14 @@
 MLP1_PACKAGE := build/mlp1/package/DiscoBoy.pak
 MLP1_BIN     := ports/mlp1/pak/bin/discoboy
 
-.PHONY: package-platform package-mlp1 mlp1 clean
+.PHONY: package-platform package-mlp1 mlp1 test-sources clean
+
+test-sources:
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror \
+		-Icmd/discoboy cmd/discoboy/disco_sources.c cmd/discoboy/disco_sources_test.c \
+		-o /tmp/discoboy-sources-test
+	/tmp/discoboy-sources-test
+	rm -f /tmp/discoboy-sources-test
 
 package-platform:
 	@test -n "$(PLATFORM)" || { echo "usage: make package-platform PLATFORM=<platform>" >&2; exit 1; }
