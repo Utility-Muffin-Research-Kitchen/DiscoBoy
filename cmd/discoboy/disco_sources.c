@@ -12,17 +12,6 @@ static void disco_source_error(char *out, size_t n, const char *message) {
     if (out && n) snprintf(out, n, "%s", message);
 }
 
-static int disco_list_count(const char *list) {
-    if (!list || !list[0]) return 0;
-    int count = 1;
-    for (const char *p = list; *p; p++) {
-        if (*p != ':') continue;
-        if (p == list || p[1] == '\0' || p[-1] == ':') return -1;
-        count++;
-    }
-    return count;
-}
-
 static int disco_source_normalize(const char *input, char *out, size_t n) {
     char resolved[PATH_MAX];
     const char *value = realpath(input, resolved) ? resolved : input;
@@ -95,13 +84,10 @@ int disco_sources_resolve(disco_sources *out, char *error, size_t error_size) {
         paths = fallback;
     }
     if (!disco_sources_parse(out, paths, error, error_size)) return 0;
-    const char *cards = getenv("SDCARD_PATHS");
-    int card_count = disco_list_count(cards);
-    if (cards && cards[0] && (card_count < 0 || card_count != out->count)) {
-        disco_source_error(error, error_size, "MUSIC_PATHS count does not match SDCARD_PATHS");
-        memset(out, 0, sizeof(*out));
-        return 0;
-    }
+    /* MUSIC_PATHS source count is intentionally NOT cross-checked against
+       SDCARD_PATHS. The two are published by different, independently-versioned
+       layers (the music roots vs. the mounted-card list), so a mismatch is normal
+       -- e.g. firmware that exports SDCARD_PATHS but not yet MUSIC_PATHS. */
     const char *primary = getenv("MUSIC_PATH");
     if (primary && primary[0]) {
         char normalized[DISCO_SOURCE_PATH_MAX];
@@ -113,6 +99,25 @@ int disco_sources_resolve(disco_sources *out, char *error, size_t error_size) {
         }
     }
     return 1;
+}
+
+void disco_sources_single_fallback(disco_sources *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    const char *music = getenv("MUSIC_PATH");
+    const char *sd = getenv("SDCARD_PATH");
+    char raw[DISCO_SOURCE_PATH_MAX];
+    if (music && music[0]) snprintf(raw, sizeof(raw), "%s", music);
+    else if (sd && sd[0]) snprintf(raw, sizeof(raw), "%s/Music", sd);
+    else snprintf(raw, sizeof(raw), "Music");
+    disco_source *source = &out->items[0];
+    if (!disco_source_normalize(raw, source->root, sizeof(source->root)))
+        snprintf(source->root, sizeof(source->root), "%s", raw);
+    snprintf(source->id, sizeof(source->id), "primary");
+    snprintf(source->label, sizeof(source->label), "SD1");
+    struct stat st;
+    source->available = stat(source->root, &st) == 0 && S_ISDIR(st.st_mode);
+    out->count = 1;
 }
 
 int disco_album_identity_equal(const char *album_a, const char *artist_a,

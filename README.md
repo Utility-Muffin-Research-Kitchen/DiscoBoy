@@ -19,10 +19,18 @@ straight to a Bluetooth headset when one is connected.
 
 ## Install
 
-Disco Boy is a standalone Pak Rat app and is not bundled with Leaf's default payload.
-Its Pak Rat catalog entry will be published only after the release artifact passes the
-full Leaf verification gate. Put music under `Music/` on either SD card (see
-[Music location](#music-location)).
+Disco Boy is a standalone app, not bundled with Leaf's default payload. Install it
+either way:
+
+- **Pak Rat (on-device):** press **Menu**, open **Actions -> Pak Rat**, choose
+  **Disco Boy**, and install over Wi-Fi. It shows up in your **Apps** tab when the
+  install finishes.
+- **Manually:** download `DiscoBoy.pak.zip` from the
+  [latest release](https://github.com/Utility-Muffin-Research-Kitchen/DiscoBoy/releases/latest),
+  unzip it, copy the `DiscoBoy.pak` folder into `Apps/mlp1/` on your SD card, and run
+  **System -> Rescan Library**.
+
+Put music under `Music/` on either SD card (see [Music location](#music-location)).
 
 Bluetooth audio is best with Wi-Fi off — the MLP1's RTL8723DS Wi-Fi/BT coexistence causes
 occasional dropouts, not an app bug.
@@ -95,12 +103,13 @@ a "sleeve" view. SELECT again (or B) returns to where you were; playback control
 
 ## Music location
 
-Tracks are read recursively from every root in ordered `$MUSIC_PATHS`. Leaf publishes
-the primary card first and the secondary card second; an absent secondary card is
-skipped without hiding the primary library. Direct launches fall back to `$MUSIC_PATH`,
-then `$SDCARD_PATH/Music`, then `./Music`. Duplicate roots and malformed colon lists are
-rejected so the same physical files cannot appear twice merely because a card was
-configured twice.
+On Leaf builds that publish both SD cards' music roots (ordered `$MUSIC_PATHS`, primary
+card first), tracks are read recursively from each and merged; an absent secondary card
+is skipped without hiding the primary library. On firmware that does not publish those
+roots -- or on a direct launch -- Disco Boy falls back to `$MUSIC_PATH`, then
+`$SDCARD_PATH/Music`, then `./Music`, and still opens with whatever it finds. Duplicate
+roots and malformed colon lists are rejected so the same physical files cannot appear
+twice merely because a card was configured twice.
 
 Artists and Albums merge matching metadata across cards while retaining both physical
 tracks. A compact `SD1` or `SD2` label appears only when otherwise-identical tracks need

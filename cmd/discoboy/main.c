@@ -1989,10 +1989,9 @@ int main(int argc, char *argv[]) {
 
     char source_error[256];
     if (!disco_sources_resolve(&g.sources, source_error, sizeof(source_error))) {
-        cat_log("discoboy: invalid Music sources: %s", source_error);
-        disco_audio_shutdown();
-        cat_quit();
-        return 1;
+        cat_log("discoboy: Music sources unusable (%s); falling back to primary root",
+                source_error);
+        disco_sources_single_fallback(&g.sources);
     }
     disco_scan();
     for (int i = 0; i < g.sources.count; i++)
