@@ -108,8 +108,9 @@ card first), tracks are read recursively from each and merged; an absent seconda
 is skipped without hiding the primary library. On firmware that does not publish those
 roots -- or on a direct launch -- Disco Boy falls back to `$MUSIC_PATH`, then
 `$SDCARD_PATH/Music`, then `./Music`, and still opens with whatever it finds. Duplicate
-roots and malformed colon lists are rejected so the same physical files cannot appear
-twice merely because a card was configured twice.
+roots, malformed colon lists, and plural lists that do not align one-for-one with
+`$SDCARD_PATHS` are rejected so stale card identities cannot be assigned to music.
+An inconsistent plural environment still opens in degraded single-primary-root mode.
 
 Artists and Albums merge matching metadata across cards while retaining both physical
 tracks. A compact `SD1` or `SD2` label appears only when otherwise-identical tracks need

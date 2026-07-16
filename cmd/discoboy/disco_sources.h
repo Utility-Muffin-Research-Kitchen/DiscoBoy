@@ -20,7 +20,8 @@ typedef struct {
 
 /* Resolve MUSIC_PATHS in order, falling back to MUSIC_PATH, SDCARD_PATH/Music,
    then ./Music. Existing roots are canonicalized with realpath; duplicates and
-   malformed colon lists are rejected. */
+   malformed colon lists are rejected. When both plural variables are present,
+   MUSIC_PATHS must contain one item per SDCARD_PATHS item. */
 int disco_sources_resolve(disco_sources *out, char *error, size_t error_size);
 int disco_sources_parse(disco_sources *out, const char *music_paths,
                         char *error, size_t error_size);

@@ -30,14 +30,30 @@ int main(void) {
     assert(strstr(error, "duplicate") != NULL);
     assert(!disco_sources_parse(&sources, ":/tmp/music", error, sizeof(error)));
 
-    /* A MUSIC_PATHS/SDCARD_PATHS count mismatch is no longer fatal: the two are
-       published by independent layers, so resolve keeps the music roots as given. */
+    /* Present plural lists must align positionally with the same card count. */
     snprintf(list, sizeof(list), "%s:%s", primary, missing);
     setenv("MUSIC_PATHS", list, 1);
-    setenv("SDCARD_PATHS", "/card1:/card2:/card3", 1);
+    setenv("SDCARD_PATHS", "/card1:/card2", 1);
     unsetenv("MUSIC_PATH");
     assert(disco_sources_resolve(&sources, error, sizeof(error)));
     assert(sources.count == 2);
+
+    setenv("SDCARD_PATHS", "/card1:/card2:/card3", 1);
+    assert(!disco_sources_resolve(&sources, error, sizeof(error)));
+    assert(sources.count == 0);
+    assert(strstr(error, "item count") != NULL);
+
+    setenv("SDCARD_PATHS", "/card1::/card3", 1);
+    assert(!disco_sources_resolve(&sources, error, sizeof(error)));
+    assert(sources.count == 0);
+    assert(strstr(error, "empty item") != NULL);
+
+    setenv("SDCARD_PATHS", "/card1:/card2", 1);
+    setenv("MUSIC_PATH", "/not-the-primary-root", 1);
+    assert(!disco_sources_resolve(&sources, error, sizeof(error)));
+    assert(sources.count == 0);
+    assert(strstr(error, "primary") != NULL);
+    unsetenv("MUSIC_PATH");
     unsetenv("MUSIC_PATHS");
 
     /* Regression: current firmware exports SDCARD_PATHS (two entries) but not

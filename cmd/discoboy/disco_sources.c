@@ -23,6 +23,25 @@ static int disco_source_normalize(const char *input, char *out, size_t n) {
     return 1;
 }
 
+static int disco_source_list_count(const char *value, int *count,
+                                   char *error, size_t error_size) {
+    if (!value || !value[0] || !count) {
+        disco_source_error(error, error_size, "SDCARD_PATHS is empty");
+        return 0;
+    }
+    int items = 1;
+    for (const char *cursor = value; *cursor; cursor++) {
+        if (*cursor != ':') continue;
+        if (cursor == value || cursor[1] == '\0' || cursor[1] == ':') {
+            disco_source_error(error, error_size, "SDCARD_PATHS contains an empty item");
+            return 0;
+        }
+        items++;
+    }
+    *count = items;
+    return 1;
+}
+
 int disco_sources_parse(disco_sources *out, const char *music_paths,
                         char *error, size_t error_size) {
     if (!out || !music_paths || !music_paths[0]) {
@@ -74,8 +93,9 @@ int disco_sources_parse(disco_sources *out, const char *music_paths,
 
 int disco_sources_resolve(disco_sources *out, char *error, size_t error_size) {
     const char *paths = getenv("MUSIC_PATHS");
+    int has_music_paths = paths && paths[0];
     char fallback[DISCO_SOURCE_PATH_MAX];
-    if (!paths || !paths[0]) {
+    if (!has_music_paths) {
         const char *music = getenv("MUSIC_PATH");
         const char *sd = getenv("SDCARD_PATH");
         if (music && music[0]) snprintf(fallback, sizeof(fallback), "%s", music);
@@ -84,10 +104,20 @@ int disco_sources_resolve(disco_sources *out, char *error, size_t error_size) {
         paths = fallback;
     }
     if (!disco_sources_parse(out, paths, error, error_size)) return 0;
-    /* MUSIC_PATHS source count is intentionally NOT cross-checked against
-       SDCARD_PATHS. The two are published by different, independently-versioned
-       layers (the music roots vs. the mounted-card list), so a mismatch is normal
-       -- e.g. firmware that exports SDCARD_PATHS but not yet MUSIC_PATHS. */
+    const char *sdcard_paths = getenv("SDCARD_PATHS");
+    if (has_music_paths && sdcard_paths && sdcard_paths[0]) {
+        int card_count = 0;
+        if (!disco_source_list_count(sdcard_paths, &card_count, error, error_size)) {
+            memset(out, 0, sizeof(*out));
+            return 0;
+        }
+        if (card_count != out->count) {
+            disco_source_error(error, error_size,
+                               "MUSIC_PATHS item count does not match SDCARD_PATHS");
+            memset(out, 0, sizeof(*out));
+            return 0;
+        }
+    }
     const char *primary = getenv("MUSIC_PATH");
     if (primary && primary[0]) {
         char normalized[DISCO_SOURCE_PATH_MAX];
