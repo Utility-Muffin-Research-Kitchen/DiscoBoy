@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "id": "org.umrk.discoboy",
+  "name": "Disco Boy",
+  "summary": "Play music from either SD card with cover art, queue controls, and Leaf audio routing.",
+  "description": "A Catastrophe-native music player for Leaf on the Miniloong Pocket 1. Browse artists, albums, and folders across both SD cards, play common music formats, and keep audio routed through the same output Leaf is using.",
+  "author": "Utility Muffin Research Kitchen",
+  "repo_url": "https://github.com/Utility-Muffin-Research-Kitchen/DiscoBoy",
+  "categories": [
+    "music",
+    "media"
+  ],
+  "leaf": {
+    "packages": [
+      {
+        "platform": "mlp1",
+        "version": "0.2.1",
+        "artifact_name": "DiscoBoy.pak.zip",
+        "install_name": "DiscoBoy.pak",
+        "runtime_manifest_path": "pak.json",
+        "package_dir": "build/mlp1/package/DiscoBoy.pak",
+        "build_command": [
+          "make",
+          "package-platform",
+          "PLATFORM=mlp1"
+        ]
+      }
+    ]
+  }
+}
