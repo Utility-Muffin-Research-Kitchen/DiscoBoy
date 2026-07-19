@@ -7,6 +7,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 static void disco_source_error(char *out, size_t n, const char *message) {
     if (out && n) snprintf(out, n, "%s", message);
@@ -40,6 +41,84 @@ static int disco_source_list_count(const char *value, int *count,
     }
     *count = items;
     return 1;
+}
+
+static int disco_source_nth_path(const char *value, int index,
+                                 char *out, size_t out_size) {
+    const char *start = value;
+    for (int i = 0; i < index; i++) {
+        start = strchr(start, ':');
+        if (!start) return 0;
+        start++;
+    }
+    const char *end = strchr(start, ':');
+    size_t len = end ? (size_t)(end - start) : strlen(start);
+    if (len == 0 || len >= out_size) return 0;
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return 1;
+}
+
+#if defined(__linux__)
+static int disco_mount_field(char *out, size_t out_size, const char *raw) {
+    size_t used = 0;
+    for (size_t i = 0; raw[i]; i++) {
+        unsigned char value = (unsigned char)raw[i];
+        if (raw[i] == '\\' &&
+            raw[i + 1] >= '0' && raw[i + 1] <= '7' &&
+            raw[i + 2] >= '0' && raw[i + 2] <= '7' &&
+            raw[i + 3] >= '0' && raw[i + 3] <= '7') {
+            value = (unsigned char)(((raw[i + 1] - '0') << 6) |
+                                    ((raw[i + 2] - '0') << 3) |
+                                    (raw[i + 3] - '0'));
+            i += 3;
+        }
+        if (used + 1 >= out_size) return 0;
+        out[used++] = (char)value;
+    }
+    out[used] = '\0';
+    return 1;
+}
+
+static int disco_mountinfo_has_root(const char *root) {
+    const char *fixture = getenv("DISCO_SOURCE_TEST_MOUNTINFO");
+    FILE *fp = fopen(fixture && fixture[0] ? fixture : "/proc/self/mountinfo", "r");
+    if (!fp) return 0;
+    char *line = NULL;
+    size_t capacity = 0;
+    int found = 0;
+    while (getline(&line, &capacity, fp) >= 0) {
+        char *save = NULL;
+        char *field = strtok_r(line, " \n", &save);
+        for (int index = 0; field && index < 4; index++)
+            field = strtok_r(NULL, " \n", &save);
+        if (!field) continue;
+        char mountpoint[PATH_MAX];
+        if (disco_mount_field(mountpoint, sizeof(mountpoint), field) &&
+            strcmp(mountpoint, root) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    free(line);
+    fclose(fp);
+    return found;
+}
+#endif
+
+static int disco_secondary_available(const char *card_root,
+                                     const char *music_root) {
+    struct stat st;
+    if (stat(music_root, &st) != 0 || !S_ISDIR(st.st_mode)) return 0;
+    const char *fixture = getenv("DISCO_SOURCE_TEST_AVAILABLE");
+    if (fixture && fixture[0])
+        return strcmp(fixture, "1") == 0 || strcasecmp(fixture, "true") == 0;
+#if defined(__linux__)
+    return disco_mountinfo_has_root(card_root);
+#else
+    (void) card_root;
+    return 1;
+#endif
 }
 
 int disco_sources_parse(disco_sources *out, const char *music_paths,
@@ -116,6 +195,21 @@ int disco_sources_resolve(disco_sources *out, char *error, size_t error_size) {
                                "MUSIC_PATHS item count does not match SDCARD_PATHS");
             memset(out, 0, sizeof(*out));
             return 0;
+        }
+        for (int i = 1; i < out->count; i++) {
+            char card_root[DISCO_SOURCE_PATH_MAX];
+            char normalized[DISCO_SOURCE_PATH_MAX];
+            if (!disco_source_nth_path(sdcard_paths, i,
+                                       card_root, sizeof(card_root)) ||
+                !disco_source_normalize(card_root, normalized,
+                                        sizeof(normalized))) {
+                disco_source_error(error, error_size,
+                                   "SDCARD_PATHS contains an invalid source root");
+                memset(out, 0, sizeof(*out));
+                return 0;
+            }
+            out->items[i].available =
+                disco_secondary_available(normalized, out->items[i].root);
         }
     }
     const char *primary = getenv("MUSIC_PATH");

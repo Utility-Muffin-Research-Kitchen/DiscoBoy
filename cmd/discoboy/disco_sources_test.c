@@ -37,6 +37,11 @@ int main(void) {
     unsetenv("MUSIC_PATH");
     assert(disco_sources_resolve(&sources, error, sizeof(error)));
     assert(sources.count == 2);
+    assert(mkdir(missing, 0700) == 0);
+    setenv("DISCO_SOURCE_TEST_AVAILABLE", "1", 1);
+    assert(disco_sources_resolve(&sources, error, sizeof(error)));
+    assert(sources.items[1].available == 1);
+    unsetenv("DISCO_SOURCE_TEST_AVAILABLE");
 
     setenv("SDCARD_PATHS", "/card1:/card2:/card3", 1);
     assert(!disco_sources_resolve(&sources, error, sizeof(error)));
@@ -77,6 +82,7 @@ int main(void) {
     assert(disco_album_identity_equal("OST", "Composer", "ost", "composer"));
     assert(!disco_album_identity_equal("OST", "Composer A", "OST", "Composer B"));
 
+    assert(rmdir(missing) == 0);
     assert(rmdir(primary) == 0);
     assert(rmdir(base) == 0);
     puts("disco_sources_test: ok");
