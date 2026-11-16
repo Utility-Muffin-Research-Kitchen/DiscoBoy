@@ -58,10 +58,10 @@ now-playing and album-header art are full resolution.
 The common formats decode through small vendored single-header decoders under
 `third_party/`: **WAV** (dr_wav), **MP3** (dr_mp3), **FLAC** (dr_flac), and **OGG
 Vorbis** (stb_vorbis). Everything else - **M4A / AAC / ALAC, Opus, WMA, AIFF, APE,
-WavPack, ...** - decodes through **FFmpeg**, which the device already ships (the
-LoongOS Kodi build). The app links against tiny SONAME stub libraries and binds to
-the device's real `libav*` at runtime, so no FFmpeg binaries are shipped in the pak.
-Tags, duration, and embedded art for those formats also come from FFmpeg.
+WavPack, ...** - decodes through **FFmpeg**. The pak ships its own trimmed FFmpeg
+4.4 build in `lib/` (audio demuxers and decoders only), so it plays the same on
+LoongOS 1.3, which has FFmpeg 4.4 in `/usr/lib`, and 1.4, which replaced it with
+6.1. Tags, duration, and embedded art for those formats also come from FFmpeg.
 
 Output is **libasound (ALSA) direct**, not SDL audio: a playback thread streams
 decoded S16 frames to a pcm. The device follows Leaf's live `audio_output`:
@@ -139,16 +139,21 @@ make package-platform PLATFORM=mlp1
 assembles the staged pak from `pak/` + the binary. Leaf wires app packaging through
 its own root `make package-platform` / `make stage-app APP=DiscoBoy DEVICE=mlp1`.
 
-The FFmpeg fallback uses vendored FFmpeg 4.4 public headers
-(`third_party/ffmpeg/include`) plus small SONAME stub libraries
-(`third_party/ffmpeg/stub`) generated only to satisfy the linker; the device
-provides the real `libav*` at runtime. `scripts/make-record-placeholder.py`
+The FFmpeg fallback compiles against vendored FFmpeg 4.4 public headers
+(`third_party/ffmpeg/include`) and links against small SONAME stub libraries
+(`third_party/ffmpeg/stub`). `scripts/build-mlp1-ffmpeg.sh` (run by `make mlp1`)
+fetches the pinned FFmpeg 4.4.8 release, checks its SHA-256, and builds the shared
+libraries in the toolchain container with `ports/mlp1/build-ffmpeg.sh`; the result
+is cached in `build/mlp1/ffmpeg/` and packaged into the pak's `lib/`, which the
+binary finds through its `$ORIGIN/../lib` RUNPATH. `scripts/make-record-placeholder.py`
 regenerates the vinyl no-art placeholder.
 
 ## Credits
 
 Common-format decoding uses the public-domain single-header decoders dr_wav /
 dr_mp3 / dr_flac (mackron) and stb_vorbis (Sean Barrett). Other formats decode via
-FFmpeg (LGPL), dynamically linked to the copy already on the device. Transport
+FFmpeg (LGPL-2.1-or-later), shipped as unmodified shared libraries in the pak's
+`lib/`; its license and the exact source and configure line are in
+`licenses/FFmpeg/`. Transport
 glyphs are a subset of Material Icons (Apache License 2.0, Google). See
 `pak/res/media-icons.ttf`.

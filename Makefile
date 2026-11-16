@@ -7,6 +7,7 @@
 MLP1_PACKAGE := build/mlp1/package/DiscoBoy.pak
 MLP1_ARCHIVE := build/mlp1/DiscoBoy.pak.zip
 MLP1_BIN     := ports/mlp1/pak/bin/discoboy
+MLP1_FFMPEG  := build/mlp1/ffmpeg
 PAK_VERSION  := $(shell python3 -c 'import json; print(json.load(open("pak/pak.json"))["pak_version"])')
 
 .PHONY: package-platform package-mlp1 package-archive package-smoke mlp1 test test-sources pakrat-metadata-check clean
@@ -34,12 +35,15 @@ package-platform:
 mlp1:
 	@./scripts/build-mlp1.sh
 
-# Build, then assemble the staged pak: pak/ template + the built binary.
+# Build, then assemble the staged pak: pak/ template + the built binary + the
+# bundled FFmpeg (lib/) and its license and source notice (licenses/FFmpeg/).
 package-mlp1: mlp1
 	@rm -rf "$(MLP1_PACKAGE)"
-	@mkdir -p "$(MLP1_PACKAGE)/bin"
+	@mkdir -p "$(MLP1_PACKAGE)/bin" "$(MLP1_PACKAGE)/lib" "$(MLP1_PACKAGE)/licenses/FFmpeg"
 	@cp -R pak/launch.sh pak/pak.json pak/res "$(MLP1_PACKAGE)/"
 	@cp "$(MLP1_BIN)" "$(MLP1_PACKAGE)/bin/discoboy"
+	@cp $(MLP1_FFMPEG)/lib/*.so.* "$(MLP1_PACKAGE)/lib/"
+	@cp $(MLP1_FFMPEG)/licenses/* "$(MLP1_PACKAGE)/licenses/FFmpeg/"
 	@echo "=== Packaged: $(MLP1_PACKAGE) ==="
 
 package-archive: package-mlp1
