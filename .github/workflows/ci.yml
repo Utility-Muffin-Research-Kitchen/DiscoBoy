@@ -17,3 +17,49 @@ jobs:
 
       - name: Check release scripts
         run: python3 -m py_compile scripts/*.py
+
+  # Builds the bundled FFmpeg and the binary with the release lock, then checks
+  # that the pak carries every FFmpeg library the binary needs.
+  package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Disco Boy
+        uses: actions/checkout@v4
+        with:
+          path: DiscoBoy
+
+      - name: Read release lock
+        id: release-lock
+        working-directory: DiscoBoy
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          lock = json.load(open("release-lock.json", encoding="utf-8"))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"catastrophe_commit={lock['catastrophe_commit']}\n")
+              output.write(f"jawaka_commit={lock['jawaka_commit']}\n")
+              output.write(f"toolchain={lock['mlp1_toolchain_image']}\n")
+          PY
+
+      - name: Checkout pinned Catastrophe
+        uses: actions/checkout@v4
+        with:
+          repository: Utility-Muffin-Research-Kitchen/Catastrophe
+          ref: ${{ steps.release-lock.outputs.catastrophe_commit }}
+          path: Catastrophe
+
+      - name: Checkout pinned Jawaka
+        uses: actions/checkout@v4
+        with:
+          repository: Utility-Muffin-Research-Kitchen/Jawaka
+          ref: ${{ steps.release-lock.outputs.jawaka_commit }}
+          path: Jawaka
+
+      - name: Build and smoke-test the MLP1 package
+        working-directory: DiscoBoy
+        env:
+          MLP1_TOOLCHAIN_IMAGE: ${{ steps.release-lock.outputs.toolchain }}
+        run: make package-smoke

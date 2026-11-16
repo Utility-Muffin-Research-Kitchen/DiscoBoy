@@ -1,19 +1,21 @@
 # Vendored FFmpeg interface (not FFmpeg itself)
 
 Disco Boy decodes the formats the single-header decoders don't cover (M4A/AAC/ALAC,
-Opus, WMA, AIFF, ...) through **FFmpeg, which already ships on the device** (the
-LoongOS Kodi build, `libav*` 4.4 / avcodec 58). This directory holds only what's
-needed to *compile and link* against that runtime copy — no FFmpeg code or binaries:
+Opus, WMA, AIFF, ...) through **FFmpeg 4.4** (`libav*` 4.4 / avcodec 58). The pak
+ships that runtime itself in `lib/`, built by `scripts/build-mlp1-ffmpeg.sh`,
+because LoongOS 1.4 replaced the stock FFmpeg 4.4 with 6.1. This directory holds
+only what's needed to *compile and link* against it — no FFmpeg code or binaries:
 
 - `include/` — the FFmpeg 4.4 **public headers** actually reached by `disco_ff.c`
   (the transitive closure: libavformat/avcodec/avutil/swresample), plus a generated
   `libavutil/avconfig.h` for aarch64 little-endian. FFmpeg headers are LGPL-2.1+.
 - `stub/` — tiny `libav*.so.N` **link stubs** with the correct SONAMEs, generated to
   satisfy the linker. They contain empty symbols, no implementation; at runtime the
-  binary binds to the device's real `libav*`.
+  binary binds to the pak's `lib/libav*` through its `$ORIGIN/../lib` RUNPATH.
 
-The app links FFmpeg dynamically and ships none of it, so Disco Boy stays MIT while
-FFmpeg stays under its own license on the device.
+The app links FFmpeg dynamically and ships it as separate, unmodified LGPL shared
+libraries, so Disco Boy stays MIT while FFmpeg stays under its own license
+(`licenses/FFmpeg/` in the pak).
 
 Regenerate: extract the four libs' headers from the matching FFmpeg release, recompute
 the closure with the cross `gcc -M`, and build the stubs with

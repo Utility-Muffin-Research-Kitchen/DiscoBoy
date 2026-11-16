@@ -17,11 +17,13 @@ APP_CFLAGS    := -std=gnu11 -Wall -Wextra -Wno-unused-parameter $(COMMON)
 VENDOR_CFLAGS := -std=gnu11 -w $(COMMON)   # dr_*, stb_vorbis, cJSON: third-party, silence noise
 
 # FFmpeg fallback decoder (disco_ff.c): vendored 4.4 headers, linked against tiny
-# SONAME stub libs (third_party/ffmpeg/stub) so the device's real libav* (FFmpeg
-# 4.4) satisfy the symbols at runtime. No FFmpeg binaries shipped in the app.
+# SONAME stub libs (third_party/ffmpeg/stub). At runtime the binary loads the
+# FFmpeg 4.4 the pak ships in lib/ (scripts/build-mlp1-ffmpeg.sh), found through
+# RUNPATH $ORIGIN/../lib: LoongOS 1.3 has FFmpeg 4.4 in /usr/lib, 1.4 has 6.1.
 FF_INC   := -I$(DISCOBOY)/third_party/ffmpeg/include
 FF_LIBS  := -L$(DISCOBOY)/third_party/ffmpeg/stub \
-            -l:libavformat.so.58 -l:libavcodec.so.58 -l:libavutil.so.56 -l:libswresample.so.3
+            -l:libavformat.so.58 -l:libavcodec.so.58 -l:libavutil.so.56 -l:libswresample.so.3 \
+            -Wl,-rpath,'$$ORIGIN/../lib' -Wl,--enable-new-dtags
 
 # Audio output is libasound (ALSA) direct, so it can target the `bluealsa` pcm for
 # Bluetooth the same way the RetroArch runner does. SDL is still linked for the UI.
