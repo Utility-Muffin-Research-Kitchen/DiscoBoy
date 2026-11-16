@@ -43,6 +43,7 @@ configure_args=(
   --disable-programs --disable-doc --disable-debug
   --disable-avdevice --disable-avfilter --disable-postproc --disable-swscale
   --disable-network
+  --enable-pthreads
   --enable-avformat --enable-avcodec --enable-swresample --enable-zlib
   --enable-protocol=file
   --enable-demuxer="$(join "${demuxers[@]}")"
@@ -53,6 +54,10 @@ configure_args=(
   || { tail -40 /tmp/ff_configure.log; tail -30 ffbuild/config.log; exit 1; }
 # A misspelt component is only a configure warning; make it fatal.
 if grep -i "did not match anything" /tmp/ff_configure.log; then exit 1; fi
+# --disable-autodetect also turns threads off unless asked for. Without them
+# FFmpeg's internal locks and once-initialisers are no-ops, and Disco Boy calls
+# it from the playback thread and the tag scan at the same time.
+grep -q "^#define HAVE_PTHREADS 1$" config.h || { echo "pthreads are not enabled" >&2; exit 1; }
 # Each library carries RUNPATH $ORIGIN so it finds its siblings in the pak's
 # lib/ before the firmware's /usr/lib. Appended to config.mak rather than passed
 # as --extra-ldsoflags, which configure re-evaluates; library.mak expands the
